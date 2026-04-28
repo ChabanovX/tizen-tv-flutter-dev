@@ -65,6 +65,45 @@ Do **not** rewrite the whole file unless the user explicitly asks for a cleanup.
 
 Do **not** remove existing findings unless they are proven wrong and actively misleading. If correcting a previous finding, append a correction entry that clearly says what was wrong and what replaced it.
 
+## Git commit requirement
+
+After modifying `docs/FINDINGS.md`, create a git commit for that change.
+
+The commit should be small and focused. It should include only the relevant finding update unless the user explicitly requested other changes.
+
+Use a short commit message that explains the finding, for example:
+
+```bash
+git add docs/FINDINGS.md
+git commit -m "Document Samsung TV certificate install blocker"
+```
+
+Good commit messages:
+
+```text
+Document Samsung TV certificate install blocker
+Record working SDB cmdline parameters
+Document flutter-tizen emulator deploy failure
+Record Samsung certificate profile fix
+```
+
+Bad commit messages:
+
+```text
+update
+fix
+changes
+wip
+```
+
+Before committing, inspect the diff:
+
+```bash
+git diff -- docs/FINDINGS.md
+```
+
+Do not commit unrelated files.
+
 ## What counts as a useful finding
 
 Useful findings include:

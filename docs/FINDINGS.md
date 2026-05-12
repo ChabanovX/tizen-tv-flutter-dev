@@ -448,3 +448,67 @@ Tried CPU and machine config variants — `-smp 1`, kernel `noxsave nopti nokasl
 3. **Rebuild the Tizen TV kernel** with virtio-gpu compiled in, so stock QEMU 11 can give it a display. Requires kernel source + Samsung patches + cross-build toolchain.
 
 All three are weeks of expert work. **Recommendation: stop pursuing display on this Apple Silicon setup.** Use a real Samsung Tizen TV in Dev Mode for UI validation; keep stock QEMU 11 for non-UI work (build/install verification, CI integration, unit/integration tests that don't touch GL).
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 00:05 Europe/Moscow
+
+### Custom kernel with virtio-gpu boots Tizen TV image; libevas TCG crash disappears; only Samsung-specific powerdown blocks UI
+
+**Status:** verified (major progress, one Samsung-specific blocker remains)
+
+**Finding:** Built a custom Tizen TV emulator kernel from public source with `CONFIG_DRM_VIRTIO_GPU=y` added. Stock QEMU 11 + this custom kernel boots successfully, virtio-gpu attaches to the virtio-vga device, framebuffer is exposed. The libevas TCG crash at `+0x7e5d2` (the show-stopper on Samsung's QEMU 2.8) **does NOT happen** with stock QEMU 11. Enlightenment starts and reaches `lwipc: c#0 '/tmp/fms_ready', status=1`.
+
+**Steps that worked:**
+1. Found kernel source at `https://git.tizen.org/cgit/sdk/emulator/emulator-kernel/`, branch `accepted/tizen_10.0_unified` (commit `39b6687fdb8e0493d9cc61423b272638ae0e9de2`). Version matches: Linux 4.4.35.
+2. Downloaded snapshot via `https://git.tizen.org/cgit/sdk/emulator/emulator-kernel/snapshot/<commit>.tar.gz` (~131 MB).
+3. Used Docker (Ubuntu 24.04 + `gcc-x86-64-linux-gnu` cross compiler) to build on arm64 Mac. Source MUST extract on case-sensitive FS — macOS HFS+ drops one of `xt_TCPMSS.c`/`xt_tcpmss.c`. Solution: extract inside a Docker volume.
+4. Followed Samsung's own `build-x86_64.sh` recipe:
+   ```bash
+   ARCH=x86_64 make tizen_emul_defconfig
+   sed -i "s/^EXTRAVERSION.*/EXTRAVERSION = -x86_64/" Makefile
+   ./scripts/config --set-str CONFIG_INITRAMFS_SOURCE ramfs/initramfs.x86_64 -e CONFIG_CRYPTO_AES_X86_64
+   # Plus our additions:
+   ./scripts/config -e CONFIG_DRM_VIRTIO_GPU -e CONFIG_DRM_BOCHS -e CONFIG_DRM_QXL \
+                    -e CONFIG_DRM_CIRRUS_QEMU -e CONFIG_FB_VESA -e CONFIG_FB_EFI -e CONFIG_FB_SIMPLE
+   yes "" | make olddefconfig
+   ARCH=x86_64 make -j$(nproc) bzImage
+   ```
+5. Boot with stock QEMU 11 + `-vga virtio-vga -display cocoa` + custom bzImage.
+
+**Evidence from kernel log:**
+```
+[    0.826428] [drm] Initialized drm 1.1.0 20060810
+[    0.828082] [drm] pci: virtio-vga detected
+[    0.831713] [drm] virtio vbuffers: 80 bufs, 192B each, 15kB total.
+[    0.856241] virtio_gpu virtio0: fb0: virtiodrmfb frame buffer device
+[    0.891587] [drm] Initialized virtio_gpu 0.0.1 0 on minor 0
+[/sbin/init] Start init process!!!!!!!!!!!!!!!!
+[    7.799901] lwipc: [ 1597    enlightenment] c#0 '/tmp/fms_ready', status=1
+```
+
+`grep -c "general protection" qemu_gfx.klog` returns `0`. The libevas crash that consistently appeared on Samsung's QEMU 2.8 TCG is GONE on stock QEMU 11.
+
+**Remaining blocker — Samsung-specific powerdown:**
+~28s into boot, system powers off:
+```
+/usr/bin/run_enlightenment.sh: line 43: /proc/vd_signal_policy_list: No such file or directory
+[   28.776741][PWR] powerdown - menu(0)/reset(-1)/always(1)/cold poweroff reason(0 - 31)
+[   28.777611][PWR] reboot(poweroff)
+ACPI: Preparing to enter system sleep state S5
+```
+
+`/proc/vd_signal_policy_list` is created by a Samsung TV-specific kernel module that is **not** part of the public `sdk/emulator/emulator-kernel` source. With the original Samsung kernel, this file exists and the powerdown does not happen. Some Tizen TV "no signal detected" path triggers cold poweroff.
+
+**Why it matters:** Display problem is now provably solvable — virtio-gpu works, libevas crash is QEMU 2.8 TCG, not the binary. The remaining work is unlocking Samsung's TV-specific kernel bits OR patching userspace `run_enlightenment.sh` to ignore the missing proc file.
+
+**Next actions:**
+1. Look for the TV-specific module source (likely `platform/kernel/linux-tizen-modules` or a Samsung-internal repo).
+2. Or patch `/usr/bin/run_enlightenment.sh` in the qcow2 to handle missing `/proc/vd_signal_policy_list` gracefully (faster path).
+3. Or add a kernel cmdline / module that fakes the proc file.
+
+Artifacts saved at `docs/kernel-build/`:
+- `bzImage.x86_64.gfx` — our custom kernel with virtio-gpu
+- `samsung-original.sh` — Samsung's build script (reference)
+- `tizen_emul_defconfig` — base config

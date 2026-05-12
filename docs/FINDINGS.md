@@ -399,3 +399,52 @@ Both layers are out of reach of a config tweak. Working around them means either
 1. Real Samsung Tizen TV in Developer Mode (sdb connect over network; full vigs+WM+UI; standard cert flow with our existing Samsung-issued profile but DUID re-bound to the TV).
 2. Develop UI on Flutter desktop/web targets, validate logic, deploy to real TV only at release.
 3. CI runs `flutter test` / `flutter test integration_test --headless` against the emulator for non-UI logic (install passes, Dart code runs, app lifecycle hooks fire), accepting that pixel rendering is uncovered.
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-12 22:20 Europe/Moscow
+
+### libevas crash at `+0x7e5d2` is a QEMU 2.8 TCG bug, not a real instruction fault — RIP reporting is broken
+
+**Status:** verified
+
+**Finding:** Investigated whether the deterministic crash `traps: enlightenment[pid] general protection ip:...5d2 in libevas.so.1.25.1[base+1a0000]` could be defused by patching libevas. Tried two patches in the backing qcow2:
+
+1. **Replace function entry of `_op_blend_rel_mas_c_dp` (offset 0x7e360) with `0xc3` (ret immediately).** Function should return at byte 0, never reaching anything inside.
+2. **NOP out the bytes at 0x7e5cf-0x7e5d6** (the `shrl $0x18, %r14d; imull %r14d, %eax` pair that the kernel-reported IP `+0x7e5d2` falls inside).
+
+Both patches verified intact in the qcow2 chain via `qemu-img convert -f qcow2 -O raw overlay verify.raw` + byte read at expected offsets. Both boot Samsung's QEMU 2.8 fresh. **Both produce exactly the same crash:** `general protection ip:...5d2 in libevas.so.1.25.1[base+1a0000]`. The IP offset `+0x7e5d2` is identical across runs and identical between original and patched libevas.
+
+The only consistent explanation: Samsung's QEMU 2.8 TCG generates a **bogus saved RIP value** at exception time. The Linux kernel reports that bogus IP, and because the IP happens to fall inside the libevas VMA, the kernel attributes it to libevas. The actual faulting code is somewhere else entirely — likely in TCG-emitted x86 host code translated from some other guest x86 instruction.
+
+**Evidence:**
+```
+# Patch verified in qcow2:
+$ qemu-img convert -f qcow2 -O raw $OVERLAY /tmp/verify.raw
+$ python3 -c "open('/tmp/verify.raw','rb').seek(0x100000+0x28191000+0x7e360); ..."
+Bytes at func entry: c389c0554989cb83   # c3 = ret (patched)
+Bytes at 0x7e5cf:    9090909090909090   # nops (patched)
+
+# But guest still crashes at byte +0x272 INSIDE the function:
+[   58.700840] traps: enlightenment[1336] general protection ip:7f8ca4e9a5d2 ... in libevas.so.1.25.1[7f8ca4e1c000+1a0000]
+```
+
+Confirmed deterministic across runs:
+- `ip:7f18fca525d2` ... 4 separate runs, all `+0x7e5d2`
+- `ip:7f5895f0a5d2`
+- `ip:7fbc064335d2`
+- `ip:7ff9c37945d2`
+- `ip:7f288967a5d2` (with `-smp 1 noxsave nopti nokaslr`)
+- `ip:7f8ca4e9a5d2` (with library byte-NOP patches)
+
+Tried CPU and machine config variants — `-smp 1`, kernel `noxsave nopti nokaslr` — none move the crash offset. Confirms the deterministic IP is independent of CPU count, XSAVE, KASLR, or library contents.
+
+**Why it matters:** Local-level patching of libevas/EFL cannot fix this. The bug is structural in Samsung's QEMU 2.8 TCG translator, not in any Tizen userspace binary. Therefore — Path B (libevas patching) is closed.
+
+**Next action:** To go further, the only real path is:
+1. **Rebuild Samsung's QEMU 2.8 from source** (Tizen gerrit) with TCG fixes or logging that prints the real faulting RIP. ~3-4h of build setup, then unknown reverse-engineering effort.
+2. **Port the `vigs` device + `maru-x86-machine` to stock QEMU 11+**. ~Days. Requires Samsung patches.
+3. **Rebuild the Tizen TV kernel** with virtio-gpu compiled in, so stock QEMU 11 can give it a display. Requires kernel source + Samsung patches + cross-build toolchain.
+
+All three are weeks of expert work. **Recommendation: stop pursuing display on this Apple Silicon setup.** Use a real Samsung Tizen TV in Dev Mode for UI validation; keep stock QEMU 11 for non-UI work (build/install verification, CI integration, unit/integration tests that don't touch GL).

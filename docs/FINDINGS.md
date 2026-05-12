@@ -353,3 +353,49 @@ $ ~/tizen-studio/tools/sdb -s emulator-26101 shell "echo hi" </dev/null
 **Next action:** Two workarounds to try:
 1. Add `hostfwd=tcp::*observatory*-:8888-8899` rule on QEMU monitor to forward Observatory ports, then attach Dart DevTools directly to `127.0.0.1:<port>` instead of waiting on dlog.
 2. Check whether starting Tizen with `sdbd-env-generator` arguments adjusted (e.g., `--with-debug`) enables intershell. Both probably need digging into sdbd binary further.
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-12 21:30 Europe/Moscow
+
+### Display rendering is structurally blocked on Apple Silicon — both QEMU paths fail at a different layer
+
+**Status:** verified (negative, both branches)
+
+**Finding:** Tried both QEMU paths to see if either renders the Tizen TV UI:
+
+**Path A — stock QEMU 11 with virtio-vga or `-vga std` + `-display cocoa`:**
+- QEMU window opens, kernel sees the PCI VGA device (`vgaarb: setting as boot device: PCI:0000:00:02.0` or `:00:03.0`), DRM core initializes (`[drm] Initialized drm 1.1.0`).
+- But: **no DRM driver attaches.** Samsung's custom kernel 4.4.35 has no `bochs-drm`, `virtio-gpu`, `qxl`, or `cirrus` driver compiled in — it's built specifically for the Samsung `vigs` graphics device, which is a custom QEMU device not in stock QEMU.
+- Tizen userspace (enlightenment + libevas + EFL) can never get a working EGL surface. Flutter engine binds to the libflutter_engine.so → libevas → vigs chain, fails to create a renderer, and the app crashes early. `sdb forward --list` shows Dart Observatory ports forwarded but the underlying processes never bind.
+
+**Path B — Samsung's bundled QEMU 2.8.0 with vigs:**
+- Re-applied the NOP patch at file offset `0x1d708b` (lost when bootstrap-tizen-tv-emulator.sh reinstalled the `TV-SAMSUNG-Public-Emulator` package).
+- vigs device present (logs show `vigs_device_reset: VIGS reset`).
+- But: **the same TCG bugs from the original session resurface** — and `Haswell-noTSX` only patches a subset. Within 80s of boot, `enlightenment` always crashes with `general protection ip:...5d2 in libevas.so.1.25.1[+0x7e5d2]` — same fixed offset every time. cynara/fconfigd/launchpad-proce also crash at their known fixed offsets. With WM dead before it ever paints, no UI is shown.
+
+**Evidence:**
+```bash
+# Path A klog
+[    0.524435] vgaarb: setting as boot device: PCI:0000:00:03.0
+[    0.771412] [drm] Initialized drm 1.1.0
+# no virtio_gpu / bochs_drm / etc. afterwards
+
+# Path B klog
+[   24.249693] traps: cynara[1277] general protection ip:7fb396ded28000 ... (+0x28000)
+[   63.635897] traps: enlightenment[1335] general protection ip:7ff9c37945d2 sp:7ffc26971d40 error:0 in libevas.so.1.25.1[7ff9c3716000+1a0000]
+```
+
+**Why it matters:** Display is gated by a hard structural problem, not config. Either:
+- Stock QEMU has no vigs → kernel has no display driver
+- Samsung QEMU has vigs but its TCG miscompiles libevas → WM dies
+
+Both layers are out of reach of a config tweak. Working around them means either patching QEMU 2.8's TCG (multi-week reverse-engineering of x86 instruction emulation), porting vigs to stock QEMU (Samsung-specific source needed), or rebuilding the Tizen TV kernel with virtio-gpu support (kernel build setup + Samsung patches).
+
+**Why this is OK:** The original project goal — `flutter-tizen run -d emulator-26101` successfully **installing** the app — is achieved (`pkgcmd` returns success, no `Check certificate error`). What's not achieved is interactive UI testing. That's a separate problem space.
+
+**Next action (recommended):** Stop pursuing display. For actual UI/UX validation, the realistic paths are:
+1. Real Samsung Tizen TV in Developer Mode (sdb connect over network; full vigs+WM+UI; standard cert flow with our existing Samsung-issued profile but DUID re-bound to the TV).
+2. Develop UI on Flutter desktop/web targets, validate logic, deploy to real TV only at release.
+3. CI runs `flutter test` / `flutter test integration_test --headless` against the emulator for non-UI logic (install passes, Dart code runs, app lifecycle hooks fire), accepting that pixel rendering is uncovered.

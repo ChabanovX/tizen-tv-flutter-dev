@@ -186,3 +186,170 @@ app_id[com.example.hello_tizen_tv] install failed[118, -12], reason: Check certi
 2. Or developing on a **real Samsung Tizen TV in Dev Mode**, registering the TV's DUID with Samsung, and signing for that device.
 
 **Next action:** User decision needed. Install Samsung Certificate Extension via VS Code Tizen extension UI (or Tizen Studio Package Manager → "Samsung Certificate Extension"), sign in with a Samsung account, generate a Samsung TV author + distributor cert there, then re-sign with that profile and retry. Without the Samsung account, this emulator path is blocked.
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-12 21:15 Europe/Moscow
+
+### Samsung Certificate Extension's webview is broken on macOS arm64 — bypass via direct curl to `/api/v1/generateSamsungCert`
+
+**Status:** verified
+
+**Finding:** The VS Code Tizen extension's "Create Certificate" webview (`tizen-certificate-manager-v2`) hangs silently when the Create button is clicked. No request reaches the backend server (`~/.tizen-extension-platform/server/dist/index.js`), and the Webview Developer Tools console shows no error — pure frontend dead code path. DUID auto-detection works, form validation passes visibly, but the submit handler does nothing.
+
+The backend server, however, is fully functional. The route `POST /api/v1/generateSamsungCert` works directly and triggers the full Samsung OAuth → CSR → `svdca.samsungqbe.com/apis/v{1,3}/{authors,distributors}` → p12 pipeline.
+
+**Bypass — use curl directly:**
+
+Get server port + token from `~/.tizen-extension-platform/server/conn.json`:
+
+```bash
+PORT=$(python3 -c 'import json;print(json.load(open("/Users/chabanovz/.tizen-extension-platform/server/conn.json"))["port"])')
+TOKEN=$(python3 -c 'import json;print(json.load(open("/Users/chabanovz/.tizen-extension-platform/server/conn.json"))["token"])')
+
+# Author cert. Server opens browser to Samsung OAuth on localhost:4794. User logs in once.
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{
+  "profileName": "hello-tizen-tv",
+  "password": "TizenAuthorPass1!",
+  "certificateType": "author",
+  "identity": "ivan",
+  "country": "KZ"
+}' "http://127.0.0.1:$PORT/api/v1/generateSamsungCert"
+
+# Distributor cert. Needs DUID. Re-authenticates (deletes saved auth file).
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{
+  "profileName": "hello-tizen-tv",
+  "password": "TizenAuthorPass1!",
+  "certificateType": "distributor",
+  "duidList": ["XTCJYJZXZBZVK"],
+  "privilege": "Public"
+}' "http://127.0.0.1:$PORT/api/v1/generateSamsungCert"
+```
+
+OAuth URL (if browser doesn't open automatically):
+```
+https://account.samsung.com/mobile/account/check.do?serviceID=v285zxnl3h&actionID=StartOAuth2&accessToken=Y&redirect_uri=http://localhost:4794/signin/callback
+```
+
+DUID is obtained via VS Code Tizen extension's Device Manager (sdb shell on this emulator is broken — `intershell_support: disabled`).
+
+**Evidence:**
+
+```
+$ cat /tmp/samsung_author_response.json
+{"status":"success","profileName":"hello-tizen-tv","certificateType":"author",
+ "certificateLocation":"/Users/chabanovz/SamsungCertificate/hello-tizen-tv/author.p12",
+ "pwdLocation":"/Users/chabanovz/SamsungCertificate/hello-tizen-tv/author.pwd",
+ "message":"Certificate generated successfully"}
+
+$ ls /Users/chabanovz/SamsungCertificate/hello-tizen-tv/
+author.crt    author.p12    distributor.crt    distributor.p12    samsung-auth-data.json
+author.csr    author.pri    distributor.csr    distributor.pri
+device-profile.xml
+```
+
+Server log of the run:
+```
+[Process] Generate samsung certificate: hello-tizen-tv (SUCCESS) in 6546ms
+distributor.p12 file created!
+```
+
+**Why it matters:** Unblocks the entire cert workflow when the GUI is unusable. The bug in the webview is in production-shipping VS Code extension version 10.3.2; expect future agents/users to hit it too. The curl path is fully replicable.
+
+**Next action:** None for cert generation itself — done. Document the curl flow alongside `start-tizen-emulator.sh` so it's runnable from scratch.
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-12 21:15 Europe/Moscow
+
+### Samsung-issued Public TV distributor cert + emulator DUID → TPK install succeeds; cert wall broken
+
+**Status:** verified
+
+**Finding:** With a Samsung-issued author + distributor cert (privilege=Public, duidList=[emulator's DUID]) bound into a `tizen security-profiles` profile and synced to the slim SDK profile path, `pkgcmd` on the emulator accepts the TPK without complaint. The `install failed[118, -12], reason: Check certificate error` from the prior finding is gone.
+
+**Evidence:**
+```
+$ flutter-tizen run -d emulator-26101
+Launching tizen/flutter/generated_main.dart on Tizen Tizen_TV_HD1080 in debug mode...
+Building a Tizen application in debug mode...
+The hello_tizen_tv profile is used for signing.
+Building a Tizen application in debug mode...                       4.9s
+✓ Built build/tizen/tpk/com.example.hello_tizen_tv-1.0.0.tpk (48.2MB)
+Installing build/tizen/tpk/com.example.hello_tizen_tv-1.0.0.tpk...        14.4s
+Connecting to the device logger is taking longer than expected...
+```
+
+No install error. The remaining "Connecting to the device logger" stall is a separate issue (see next finding).
+
+Profile that worked:
+```bash
+$ tizen security-profiles list
+hello_tizen_tv      O
+
+# profiles.xml content:
+<profile name="hello_tizen_tv">
+  <profileitem distributor="0"
+      key="/Users/chabanovz/SamsungCertificate/hello-tizen-tv/author.p12" ... />
+  <profileitem distributor="1"
+      key="/Users/chabanovz/SamsungCertificate/hello-tizen-tv/distributor.p12" ... />
+</profile>
+```
+
+Must be synced to both paths:
+```bash
+~/tizen-studio-data/profile/profiles.xml         # tizen CLI writes here
+~/.tizen-extension-platform/server/sdktools/sdk-data/profile/profiles.xml  # flutter-tizen reads here
+```
+
+**Why it matters:** This is the hard wall that blocked the project for weeks per `AGENTS.md`. Closed.
+
+**Next action:** None for install. Next blocker is device logger / display rendering — separate finding.
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-12 21:15 Europe/Moscow
+
+### `intershell_support: disabled` on this Tizen TV emulator — `sdb shell` returns empty; dlog unreachable
+
+**Status:** verified
+
+**Finding:** `sdb capability` for `emulator-26101` reports:
+```
+intershell_support: disabled
+appcmd_support: disabled
+log_enable: disabled
+sdbd_rootperm: disabled
+```
+
+`sdb -s emulator-26101 shell <cmd>` returns empty bytes for every command (echo, vconftool, cat, etc.). `sdb dlog` returns empty. `sdb root on` returns `Permission denied`. Only pkgcmd-style operations (install / uninstall / push / pull) work, because `pkgcmd_debugmode: enabled`.
+
+This blocks flutter-tizen's hot-reload mechanism, which depends on tailing `dlog` to find the Dart VM Observatory URL printed by the running Flutter engine. So even after a successful `pkgcmd -i ...`, flutter-tizen hangs at `Connecting to the device logger is taking longer than expected`.
+
+**Evidence:**
+```bash
+$ ~/tizen-studio/tools/sdb -s emulator-26101 capability | head
+secure_protocol:enabled
+intershell_support:disabled
+filesync_support:pushpull
+usbproto_support:disabled
+sockproto_support:enabled
+...
+log_enable:disabled
+log_path:/tmp
+appcmd_support:disabled
+appid2pid_support:enabled
+pkgcmd_debugmode:enabled
+
+$ ~/tizen-studio/tools/sdb -s emulator-26101 shell "echo hi" </dev/null
+# (empty, immediate return)
+```
+
+**Why it matters:** Even with cert wall broken and install succeeding, flutter-tizen hot-reload can't function on this emulator config. Static install works; dynamic Dart-side tooling does not.
+
+**Next action:** Two workarounds to try:
+1. Add `hostfwd=tcp::*observatory*-:8888-8899` rule on QEMU monitor to forward Observatory ports, then attach Dart DevTools directly to `127.0.0.1:<port>` instead of waiting on dlog.
+2. Check whether starting Tizen with `sdbd-env-generator` arguments adjusted (e.g., `--with-debug`) enables intershell. Both probably need digging into sdbd binary further.

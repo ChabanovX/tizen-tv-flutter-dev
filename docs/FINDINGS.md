@@ -1205,3 +1205,34 @@ qcow2 absolute offset: `0x1b74b3b0` (= partition-relative byte from inode 1274's
 
 (The plugin's other `_get*` capability functions follow the same pattern — likely a similar one-byte/one-instruction patch for `_getAppcmd`, `_getRootOnOff` etc. if they exist. Verify after boot.)
 
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 14:43 Europe/Moscow
+
+### is_debug patch unlocks `intershell_support` and `rootonoff_support`; sdb shell works
+
+After patching `is_debug` in `libsdbd_plugin.so` to always return 1, sdb capability now reports:
+```
+secure_protocol:enabled
+intershell_support:enabled        ← was disabled
+filesync_support:pushpull
+rootonoff_support:enabled         ← was disabled
+appcmd_support:disabled            (NOT controlled by is_debug)
+```
+
+**Verified:**
+- `sdb -s emulator-26101 shell echo hello` returns `hello` ✓
+- `sdb -s emulator-26101 shell id` returns: `uid=5001(owner) gid=100(users) ... context="User::Shell"` ✓
+
+**Remaining:**
+- `sdb push` works but is slow and occasionally drops connection mid-transfer
+- `appcmd_support:disabled` blocks the host-side `sdb install` command (uses appcmd protocol)
+- Workaround: `sdb push <tpk>` to `/home/owner/share/tmp/sdk_tools/`, then `sdb shell pkgcmd -i -t tpk -p <path>` — manual install via shell
+
+**Stack state of base_combined.qcow2 after this patch:**
+- 4 byte patches: deviced.powerdown_ap=ret (0x465909d0), libdrm_vigs.device_create version-check (0xc97e266), libtdm-emulator.drmOpen redirect (0x4039dcab), **is_debug→ret-1 in libsdbd_plugin.so (0x1b74abd0, 6 bytes)**
+- 1 binary replacement: wmreadypoke (150 KB static x86_64 musl) at `/usr/bin/enlightenment` (0x64ea000), fires 19 lwipc events at run_enlightenment.sh time so SDB completes auth
+- kernel cmdline: `video=Virtual-1:1920x1080-32@60` for HD fb0
+

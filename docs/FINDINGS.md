@@ -1556,6 +1556,13 @@ The "days of RE work" turned out to be 30 minutes. The exact failure was localiz
 
 **Next wall (likely)**: with compositor up, Flutter Tizen embedder loads, attempts `eglCreateWindowSurface` against the VIGS-only libEGL. That's expected to fail (same Mesa-virgl story). But we still haven't seen Flutter render — when we last sequenced "compositor launch + Flutter launch", enlightenment died ~12s in (likely SIGSEGV in a Tizen-extension protocol handler). Need to capture the next-fault site to understand whether (a) it's Tizen-Wayland protocol related or (b) it's the expected EGL failure.
 
+**Update**: enlightenment-patched dies on its OWN after ~50s, without any Flutter involvement. Last log line is `e-mod-tizen-virtualscreen-tv Module Enable Done 1`, then immediately `E: Begin Shutdown Procedure!` and libinput `device removed` events. Some Tizen TV module is triggering shutdown — possibly e-mod-tizen-tvs-helper-tv detecting unexpected state, or a watchdog timer. **Cocoa display still shows the SeaBIOS boot screen** (legacy fb0) — virtio-gpu's DRM scanout never gets bound as the primary cocoa surface, so even with compositor active no visual output reaches the cocoa window.
+
+**Realistic milestone gap remaining**:
+1. **Compositor stability** (~50 s → indefinite): debug what triggers `Begin Shutdown Procedure!` and patch it
+2. **Cocoa output binding** (legacy fb0 → DRM scanout): TDM needs to issue `DRM_IOCTL_MODE_SETCRTC` with the compositor's framebuffer. Possible to fake via QEMU monitor `screendump` for DRM scanout if it exists
+3. **Flutter EGL** (VIGS → Mesa-virgl): the long-known wall
+
 ### Reproducibility caveat — only the first launch worked
 
 Even with NOP-patch + LD_PRELOAD applied, enlightenment-real reached MAIN LOOP only on one specific run; subsequent attempts (same env, same patches) all failed at `E_Comp_Canvas Init Failed` with `EE_GL_TBM New Done (nil)`. After a full QEMU reboot, the next attempt also fails the same way. Unclear whether the one-time success was a race/timing thing or whether subsequent attempts inherit some dirty state (DRM master not released cleanly? EGL display cached?). Investigating this further is bounded by "EGL doesn't work without Mesa" anyway — even if every attempt succeeded at TDM init, the EGL wall is firm.

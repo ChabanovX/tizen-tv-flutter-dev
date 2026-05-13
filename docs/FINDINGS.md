@@ -619,4 +619,70 @@ A more wholesale approach would be:
 2. Patched qcow2 backing with deviced.powerdown_ap = ret AND libdrm_vigs.device_create version check bypassed (`/tmp/tizen-patched/base_combined.qcow2`)
 3. Stock QEMU 11 + Cocoa display
 
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 11:00 Europe/Moscow
+
+### Kernel-side vigs stub + TDM init bypass — both work in isolation; combined they still cannot put a pixel on the cocoa window
+
+**Status:** verified (negative — structural scanout wall, not a missing-ioctl wall)
+
+**Hypothesis tested:** "Tizen userspace fails at TDM init because the vigs DRM device it talks to has no KMS resources. If we (a) ship a minimal vigs kernel driver so userspace sees a `/dev/dri/card*` whose driver name is `vigs`, and (b) bypass the `_tdm_drm_display_initialize` failure, enlightenment will get far enough to render something to the cocoa window."
+
+**Two-part experiment:**
+
+**(a) `vigs` kernel stub.** Wrote a ~400-line in-tree DRM driver (`drivers/gpu/drm/vigs/vigs_stub.c`, replaced the original `Makefile` to build only this stub) that:
+- Registers a `platform_driver` with `.name = "vigs"` and creates a `drm_device` named `vigs`.
+- Implements all 19 vigs-specific ioctls from `include/drm/vigs_drm.h`: `VIGS_GET_PROTOCOL_VERSION` returns 14, `VIGS_CREATE_SURFACE` allocates a GEM, `VIGS_GEM_MAP` returns a mmap offset, `VIGS_SURFACE_INFO` returns cached params, `VIGS_CREATE_FENCE` / `VIGS_FENCE_SIGNALED` return signaled state, etc.
+- Wraps `compat_ioctl` in `#ifdef CONFIG_COMPAT` since the Tizen kernel config doesn't enable COMPAT.
+- Built into kernel: `~/tizen-kernel-build/output/bzImage.x86_64.gfx` (6.9MB).
+
+Boot confirms the stub: `[0.973085] vigs vigs: vigs stub registered`. With virtio-vga also probed, virtio_gpu took `/dev/dri/card0` (minor 0) and our stub took `/dev/dri/card1`. No GPF, kernel stable through 160+ seconds.
+
+**(b) TDM init bypass.** Disassembled `/hal/lib64/libtdm-emulator.so` (symlinked from `libhal-backend-tdm.so`, 131KB, exports `hal_backend_tdm_data` and `hal_backend_tdm_drm_exit`). `_tdm_drm_display_initialize` at offset `0x13610`:
+```
+call vigs_drm_device_create(disp->fd)
+if rc > 0: log+return -2
+resources = drmModeGetResources(disp->fd)
+if !resources: log "no drm resource: %s" + return -2     <-- klog showed this exact line
+plane_resources = drmModeGetPlaneResources(disp->fd)
+if !plane_resources: log + return -2
+...
+```
+
+Three-byte patch at qcow2 offset `0x100000 + 0x4028a000 + 0x13610 = 0x4039d610`:
+```
+55 48 8d -> 31 c0 c3        ; push rbp; lea ... -> xor eax,eax; ret
+```
+`libtdm-emulator.so` lives at offset `0x4028a000` inside partition 0 (rootfs); located via `python3 -c "mmap.find(b'tdm_vigs_video_layer_get_capability') ... walk back to b'\\x7fELF'"`. Applied with three single-byte `qemu-io write -P <byte> <offset> 1` calls on `/tmp/tizen-patched/base_combined.qcow2`.
+
+**Results:**
+- klog: no more `no drm resource: Invalid argument`, no more `fail to _tdm_drm_display_initialize!`.
+- klog: `ESTART: ... Compositor Init` followed by `Compositor Init Done` at 28.34s (was at 41.93s on unpatched run, then failed; now earlier and succeeds-by-lie).
+- klog: enlightenment modules `e-mod-tizen-{tvs-helper-tv,cursormgr-tv,processmgr,virtualscreen-tv}` all `Open Done` / `Enable Done`.
+- klog: `/run/wm_start` and `/tmp/wm_start` flag files dropped → enlightenment claims WM is up.
+- klog: BUT a new crash appears that wasn't there before: `tv-viewer[1350]: segfault at 18 ip ... in libwayland-client.so.0.23.1[base+0x2e4a]` — NULL deref at offset 0x18 in a wayland-client struct (TDM lying about output list means downstream wayland setup reads from zeroed struct fields, then dereferences).
+- QEMU monitor `screendump`: identical 720x400 PPM as before — **still showing SeaBIOS / "Decompressing Linux... Booting the kernel."** No pixel difference.
+
+**Why no pixels move (the structural finding):**
+
+The cocoa window is virtio-vga's scanout. The only way pixels appear in it is if something writes to virtio_gpu's framebuffer at `/dev/dri/card0` or to its fb0 fbdev. Tizen userspace doesn't write to virtio_gpu — it opens the device whose driver name is `vigs` (our card1 stub), allocates GEM objects there, and would call `drmModeSetCrtc` / `drmModePageFlip` on its scanout. Our stub has no KMS (no CRTC, no connectors), and even if we added them, our scanout would not be connected to virtio_gpu's framebuffer or to the cocoa display sink. Adding KMS to the vigs stub by itself doesn't bridge that gap.
+
+To put pixels on the cocoa window, one of:
+1. **vigs stub takes over virtio_gpu's fbdev** — vigs registers as the primary framebuffer (card0), grabs ownership of fb0, and either implements scanout by writing into virtio-gpu's command stream from kernel space, or relays buffers from userspace GEM into virtio-vga's scanout. This is a full DRM driver implementation (CRTC, plane, encoder, connector, with a virtio-gpu backend underneath) — multi-day kernel work, plus a non-trivial command-stream understanding.
+2. **Replace `libtdm-emulator.so` with one that targets virtio_gpu** — recompile the TDM emulator backend with `drmOpenWithType("virtio_gpu", ...)` and adapted vigs→virtio_gpu paths. Source is on git.tizen.org/cgit (`tdm-emulator` or similar) but reusing the Samsung `libdrm_vigs.so` would still mismatch. Multi-day.
+3. **Real `vigs` device in QEMU 11** — port Samsung's vigs PCI device from QEMU 2.8 into QEMU 11, write a `vigs_wsi=sw` software backend that pushes frames to `-display cocoa`. Multi-week — Samsung's QEMU 2.8 source is partial and the vigs↔WSI interface is undocumented.
+
+None of these is a "next quick patch."
+
+**Patch reverted.** The three bytes at `0x4039d610` were restored to `55 48 8d` so the combined backing is back to the "install + AMD launch but no UI" stack documented above. Empirically: the TDM bypass produces faster *boot logs* but no display improvement and introduces a downstream NULL deref in tv-viewer, so it's not a useful intermediate state.
+
+**Files generated this round:**
+- `~/tizen-kernel-build/stub/vigs_stub.c` (~400 LOC), built into the kernel at `~/tizen-kernel-build/output/bzImage.x86_64.gfx`. The stub is functionally complete for the vigs ioctl ABI but contributes no display because there's no scanout bridge.
+- `/tmp/qcow2-extract/0.img` + `1.img` (6 GiB each) — raw ext4 partitions extracted from `base_combined.qcow2` via `7zz x` so files can be located by signature. Used for offset arithmetic on libtdm-emulator.so; consider deleting if disk space is tight (12 GiB).
+- `/tmp/qcow2-rootfs/` — small set of extracted libs: `hal/lib64/libtdm-emulator.so`, `libhal-backend-tdm.so`, `libhal-backend-tbm-vigs.so.0.0.0`, `usr/lib64/libdrm_vigs.so.10.0.0`, `etc/hal/hal-api-tdm-manifest.xml`. Useful for further disassembly if needed.
+
+**Why this is a stopping point:** Display rendering on this stack requires either kernel-level driver bridging or wholesale userspace replacement. Neither qualifies as a quick win, and the user explicitly OK'd stopping on "большие фандинги." The working substacks (build/install/cert/AMD-launch on stock QEMU 11 + custom kernel + cert-patched qcow2) remain intact and usable for everything except actual UI rendering. For UI/render testing, a real Samsung TV in Developer Mode is the pragmatic path.
+
 This stack: boots past 28s, SDB ready, install succeeds with Samsung cert, app reaches AMD launcher, but dies in graphics init. Useful for build/install/cert/AMD-launch validation; not for actual UI testing.

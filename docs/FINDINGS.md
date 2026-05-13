@@ -756,3 +756,52 @@ Add-by-2 deterministic corruption that lands on `cli` after exactly 2 bytes is a
 **Files generated this round:** none new on the disk (kernel and qcow2 only; vigs-stub binary already committed in earlier round at `~/tizen-kernel-build/output/bzImage.x86_64.gfx`).
 
 **Why this is the wall:** The crash is a deterministic, IP-stable, "lands on `cli` after exactly 2 bytes" mid-instruction GPF — the signature of a QEMU TCG bug on Apple Silicon, not of any guest-side bug we can patch around. Every other layer in the stack is verified working: kernel boot, vigs userspace ABI satisfaction, TDM init with virtio_gpu resources, fbcon → cocoa scanout. If/when QEMU's x86 TCG on arm64 gets fixed for this case (or we switch to x86 hardware), this stack should boot all the way to a Tizen UI. Until then, building/installing/cert-flowing locally on Apple Silicon and rendering on real Samsung TV hardware remains the pragmatic split.
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 12:15 Europe/Moscow
+
+### Patch-injection experiments confirm the wall: libc bytes can't be overridden from outside QEMU on Tizen — and reading guest libc back via SDB is blocked
+
+**Status:** verified (negative — wall confirmed via multiple experiments; no further leverage)
+
+**Goal of this round:** test whether the `0x749aa` deterministic GPF can be moved or eliminated by various less-obvious means. Treat the previous "wall" call as a working hypothesis and try to break it before accepting.
+
+**Experiments run, all on the same `base_combined.qcow2` (deviced+libdrm_vigs+drmOpen patches retained):**
+
+1. **`GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-AVX,-AVX2,-SSE4_2,-SSE4_1,-FMA4,-CX8,-MMX,-FXSR` injected into `/usr/bin/run_enlightenment.sh`** via qcow2 byte patch (replaced the unused `DBUS_SESSION_BUS_ADDRESS` block, kept file size at 1412 bytes). Forces libc to use only baseline x86_64 dispatchers. **Crash IP unchanged.** Eliminates "buggy CPU-feature dispatch path" as the cause.
+
+2. **`-accel tcg,one-insn-per-tb=on`** disables QEMU's block translation entirely, translating each x86 instruction independently. Boot is ~30× slower (Compositor Init at 273s wall vs 36s normal). **Crash IP unchanged.** Eliminates "buggy multi-instruction block translation" as the cause.
+
+3. **`-accel tcg,thread=single -smp 1`** disables multi-threaded TCG. **Crash IP unchanged.** Eliminates "multi-thread translation race" as the cause.
+
+4. **QEMU `-d int,pcall` debug log** captured the exact CPU state at the #GP (vector 0x0d, error 0): RIP=libc+0x749aa, RSI/RDI hold high-entropy non-canonical values (`0x5be77dc1...`) that look like uninitialized/wide-char data, RAX/RCX/R9/R12/R13 in `0x117xxxx` heap range, RBP/RSP in stack range. Two consecutive identical #GP entries (Linux retries once with `RF` flag set) before the process is killed.
+
+5. **Patched libc bytes at `0x749aa` (the crash IP itself) in the qcow2:**
+    - `9c fa → c3 90` (ret;nop) → still GPF at 0x749aa
+    - `9c fa ff ff → 90 90 90 90` (nops) so CPU falls through to the legitimate `jmp 0x6fbc8` at 0x749ae → still GPF at 0x749aa
+    - `9c fa ff ff → cc cc cc cc` (4× int3) → still GPF at 0x749aa (would expect `SIGTRAP` if int3 were actually executed)
+   
+   The qcow2 byte changes are confirmed in place via both `qemu-io read` *and* `debugfs cat <inode>` (the file content as ext4 actually presents it). Yet the CPU does *not* observe these changes at runtime.
+
+6. **Patched `__vfwscanf_internal` entry at `0x6f940` to `cc cc cc cc cc cc`** (6× int3) — would trap any legitimate call to wide-char scanf. **No SIGTRAP in klog**, just the same `0x749aa` GPF. Confirms the function isn't being entered through its normal prologue.
+
+7. **SDB filesync to verify guest's libc**: `sdb pull /usr/lib64/libc.so.6` returns `error: You cannot pull files from this path` — sdbd is locked to `filesync_support:pushpull` but with read-side restrictions for system paths. Can't dump guest memory or libc to compare against the qcow2.
+
+8. **Statics scan**: no relocation entry, no addend, no 64-bit literal in `libc.so.6` equals `0x749aa`. The bad target is computed at runtime; it is not stored anywhere on disk.
+
+**What this rules out:** CPU dispatcher path bugs, TCG block-translation bugs, multi-thread translation bugs, simple "patch the destination" workarounds, simple "patch the function entry" workarounds.
+
+**What's left** (and why all are not actionable from outside QEMU on this hardware):
+- **Per-instruction TCG mistranslation deep in glibc** — bug *inside* QEMU's x86→arm64 host code generation for some specific x86 pattern that vfwscanf's static-data computations rely on. Same root cause as the libevas GPF on Samsung's QEMU 2.8 documented above, just in a different code path under a newer QEMU. The library bytes don't matter because the host arm64 code is wrong; the byte patches are correctly placed but the CPU jumps to a host arm64 instruction sequence that does the wrong thing irrespective of what guest bytes say.
+- **Tizen launchpad-loader caching libc in anonymous memory** before our patches take effect. Tizen has `launchpad-loader` and `launchpad-process-pool` that pre-fork app-loader processes with libc + EFL already loaded; child apps inherit these via COW. If the parent loader was started extremely early (before journal recovery completes, before disk page cache stabilizes), its libc pages could come from a different source. Plausible but not proven.
+- **QEMU TCG translation block caching** that persists across the lifetime of the QEMU process (note: not across boot — we always start QEMU fresh). For a TB to start at IP 0x749aa, QEMU would have to fetch bytes from guest physical memory at that moment. Once translated and executed, subsequent visits use the cached host code. If our patched bytes were correctly read by QEMU at first translation, the host code should reflect the patch. If they weren't, QEMU is reading from a different page than the one our qcow2 byte change reached — which would only happen if there's two copies of the page in guest physical memory (one mapped to libc's executable VMA, one our writes don't reach).
+
+None of those three are fixable with qcow2 byte patches.
+
+**One avenue left untried** (not destructive, but expensive): build QEMU from a recent git master or QEMU 12 dev with patches to TCG x86 lowering for arm64 hosts. If the bug is in QEMU 11's TCG, a newer QEMU might have it fixed. Multi-hour build via `brew install --HEAD qemu`. Worth doing if continuing this work past the current session.
+
+**Final state:** `base_combined.qcow2` keeps the three working patches (deviced.powerdown_ap=ret, libdrm_vigs.device_create version-check skip, libtdm-emulator.drmOpen("vigs")→mov eax,-1). All libc patches reverted. Boot reproducibly reaches `Compositor Init Done` + enlightenment GPF; cocoa shows kernel log via fbcon for ~30 seconds before WM-dependent daemons time out and the system gives up.
+
+**Conclusion of this loop pass:** every reasonable single-byte / single-block in-place patch to libc has been tried and ineffective. To progress further, we'd need to either (a) move to x86 hardware, (b) build a custom QEMU with the TCG fix, or (c) install a Tizen-side debugging app that can rewrite libc pages from inside the running guest (requires a TPK with platform privileges, which would require a Samsung platform cert we don't have). All three are out of scope of "byte patch + boot + observe" iteration.

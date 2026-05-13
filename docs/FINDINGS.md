@@ -1049,3 +1049,65 @@ FINDING_DATE = 2026-05-13 13:39 Europe/Moscow
 
 **For local Flutter development today:** build/sign locally on Apple Silicon (this part works completely), then run/render on real Samsung TV hardware in Developer Mode. The emulator on this hardware is useful only for build-system validation and SDB-install-flow testing — neither of which require a working compositor.
 
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 13:48 Europe/Moscow
+
+### `LwipcEventDone` ioctl from outside enlightenment — RE'd from liblwipc.so
+
+**Status:** verified positive on the ioctl mechanism, partial on the user-visible outcome
+
+**Discovery:** Tizen's `/run/.wm_ready` is **not just a file** — it's a named event in the lwipc kernel module's namespace. Services that wait on it call `LwipcWaitEvent("/run/.wm_ready")` which talks to `/dev/lwipc`. Touching the file does nothing on its own; the ioctl is the signal.
+
+**Reverse engineering** of `/usr/lib64/liblwipc.so` (16 KB; symbols `LwipcEventDone`, `LwipcWaitEvent`, etc.; `objdump -d`):
+
+```
+LwipcEventDone(name) {
+    if (name doesn't start with '/' or '/tmp/'/'/run/') return -EINVAL;
+    fd = open("/dev/lwipc", O_WRONLY);
+    ioctl(fd, 0x40409603, name);   // _IOW(0x96=‘L’, 3, char[64])
+    close(fd);
+    if (name starts with '/') creat(name, 0644);  // also drops the flag file
+    return 0;
+}
+```
+
+The magic ioctl number `0x40409603` decodes as `_IOW('L', 3, char[64])` — direction=write, magic='L', cmd=3, size=64 bytes.
+
+**Static x86_64 binary** (`wmreadypoke.c`, 150 KB, alpine musl docker, source in `docs/static-fb-test/wmreadypoke.c`):
+```c
+int fd = open("/dev/lwipc", O_WRONLY);
+ioctl(fd, 0x40409603, buf);   // buf = "/run/.wm_ready" padded to 64 bytes
+close(fd);
+creat("/run/.wm_ready", 0644);
+```
+…signaled for: `/run/.wm_ready`, `/run/wm_start`, `/tmp/wm_start`, `/tmp/.wm_ready`, `/tmp/.screen_manager_ready`, `/tmp/app_ready`, `/run/systemd/system/default.target.done`.
+
+Embedded into qcow2 at offset `0x64ea000` (overwrites `/usr/bin/enlightenment`). Original `run_enlightenment.sh` runs it via `chrt --fifo 22 /usr/bin/enlightenment > /dev/kmsg 2>&1 &`.
+
+**klog evidence (single boot):**
+```
+[7.516717] lwipc: [ 1651    enlightenment] D '/run/.wm_ready'
+[7.517630] ioctl(/run/.wm_ready) = 0
+[7.518194] creat(/run/.wm_ready) ok
+[7.518327] lwipc: [ 1651    enlightenment] D '/run/wm_start'
+[7.518458] ioctl(/run/wm_start) = 0
+[7.518589] creat(/run/wm_start) ok
+… all 7 events fire similarly
+```
+
+The `D '<event>'` line is lwipc's own debug print on the kernel-module side, confirming the ioctl reached the module and was registered as Done. `ret = 0` from our binary's ioctl call confirms success.
+
+**Partial outcome:** services that were sleeping on `/run/.wm_ready` (`boot_splashscre`, `volume-app`, `tv-viewer`) all logged a `wake-up` immediately after the ioctl. But:
+
+1. **SMACK label denial:** `audit: type=1400 ... action=denied subject="User" object="System" requested=r ... name=".wm_ready" dev="tmpfs"` — systemd-class readers can't open the created file because its SMACK label is wrong (inherits "User" from our binary, but readers expect "System"). The lwipc kernel-module ioctl path works because it doesn't go through filesystem ACL; the *file* check path doesn't.
+
+2. **sdbd** still doesn't authenticate to `device` state (boot reaches 60-70s at time of writing without sdbd starting). The compound dependency chain on a working compositor seems to extend past just lwipc — some downstream service that the systemd target waits on still isn't satisfied.
+
+**What this opens:** lwipc-event signaling from outside enlightenment is now a tractable building block. To fully unblock SDB we'd additionally need:
+- `setxattr` calls on each created file to set SMACK label = `System` (musl exposes `setxattr` but we'd need to know the right label per file)
+- Or run our binary with a different SMACK label (the inode's xattrs on /usr/bin/enlightenment need updating)
+- Or a more complete list of events; some service we haven't identified is still blocking
+

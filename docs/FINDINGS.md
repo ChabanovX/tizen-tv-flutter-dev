@@ -512,3 +512,61 @@ Artifacts saved at `docs/kernel-build/`:
 - `bzImage.x86_64.gfx` — our custom kernel with virtio-gpu
 - `samsung-original.sh` — Samsung's build script (reference)
 - `tizen_emul_defconfig` — base config
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 10:25 Europe/Moscow
+
+### Patching `deviced` powerdown_ap to no-op survives the 28s blocker; install works on custom kernel; app still can't render due to vigs ioctl mismatch
+
+**Status:** verified (significant progress, but Tizen userspace vigs dependency is the new wall)
+
+**Finding:** The 28s poweroff was triggered by `/usr/bin/deviced` (Samsung's power-management daemon) in its `powerdown_ap` function — not by the missing `/proc/vd_signal_policy_list` write in `run_enlightenment.sh`. The script's write to that proc file fails harmlessly. The actual trigger:
+
+```
+[8.816598][PWR] Invalid wakeup reason (-1924389768) perform standby reboot
+[8.822666][PWR] standby reboot invalid wakeup reason
+```
+
+`deviced.power-interface.c:pi_get_wakeup_reason` calls a vd_signal-based kernel function which returns garbage when the TV module isn't loaded; this drives `powerdown_ap` to call `reboot(LINUX_REBOOT_MAGIC1)` after a timer.
+
+**Patch applied:** First byte of `powerdown_ap` at deviced file offset `0x909d0` changed from `55` (push rbp) to `c3` (ret). Patched deviced is at file offset `0x46400000 + 0x909d0 = 0x465909d0` in partition 0 of the qcow2 backing. New backing: `/tmp/tizen-patched/base_deviced.qcow2`. Stock QEMU 11 + custom kernel (`docs/kernel-build/bzImage.x86_64.gfx`) + this backing reproducibly boots past 28s and reaches userspace.
+
+**Verified working after the patch:**
+- Boot reaches 124s+ without poweroff
+- SDB device ready: `emulator-26101 device Tizen_TV_HD1080`
+- pkgmgr install succeeds (TPK takes ~85s with WAS chain in cold-start)
+- Samsung-issued cert still accepted
+
+**New wall — Tizen libdrm_vigs vs virtio_gpu:**
+After install, flutter-tizen attempts to launch the app. sdb forwards are created (e.g. `tcp:51781 → tcp:51781`, `tcp:49431 → tcp:49431`) which means flutter-tizen detected the Observatory port intent — but TCP connections to them get `Connection reset by peer`, meaning the underlying process (the Flutter engine) crashed before binding.
+
+Klog shows the cause:
+```
+E/AVE: drmWaitVBlank (relative) failed ret: -1, DRM FD: 22, 22:Invalid argument
+```
+…spammed continuously. Samsung Tizen userspace (`libdrm_vigs.so.10.0.0`, EFL, AVE/AVOC) speaks vigs-specific DRM ioctls. Our kernel now has `virtio_gpu` (which exposes `/dev/dri/card0`), but virtio_gpu doesn't understand vigs ioctls and returns `EINVAL`. Every display-touching component fails: AVE waits for vblank, AVOC waits for EDID init, libflutter_engine fails to make an EGL surface, app exits.
+
+**Why it matters:** The chain is fundamentally hybrid:
+- Kernel side: stock virtio_gpu works
+- Userspace side: hardcoded for Samsung's custom vigs ABI
+
+Path A (port vigs device to QEMU 11+): same multi-week kernel/QEMU work as before.
+Path B (write a vigs-compatible kernel driver that maps to virtio_gpu commands): plausible but requires understanding vigs ioctl set (we have `include/drm/vigs_drm.h` from the source) and writing a translation layer — days of work.
+Path C (patch libdrm_vigs to fall back to generic DRM/KMS): also days.
+
+**Why this is a stopping point:** This is the same display-rendering wall as documented earlier, just now with a clearer attribution: not TCG bugs (already fixed by switching to QEMU 11), not power-management triggers (fixed by the deviced patch), but the vigs ABI hardcoded into Tizen TV userspace. None of those further paths is a quick win.
+
+**Current usable state:**
+- Build / install / cert flow works end-to-end
+- Pixel rendering unavailable (which is the same state as before our display work)
+- Net new capability: a kernel + qcow2 combo where boot doesn't die at 28s, giving more guest-side time to do non-rendering work
+
+Artifacts:
+- `docs/kernel-build/bzImage.x86_64.gfx` (custom kernel with virtio-gpu)
+- `/tmp/tizen-patched/base_deviced.qcow2` (qcow2 with patched deviced; reproducible from `base_patched.qcow2` source via the byte-write at offset `0x465909d0`)
+
+**Next action:** User decision. Honest summary — display rendering needs either Samsung's vigs in QEMU (no public source) or a vigs↔virtio_gpu shim (significant kernel engineering). For developing Flutter Tizen TV apps on Apple Silicon today, the pragmatic stack is:
+1. This setup (custom kernel + patched deviced + stock QEMU 11) for build/install/cert validation
+2. Real Samsung TV in Dev Mode for actual UI/rendering testing

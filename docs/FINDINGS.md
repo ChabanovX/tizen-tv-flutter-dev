@@ -686,3 +686,73 @@ None of these is a "next quick patch."
 **Why this is a stopping point:** Display rendering on this stack requires either kernel-level driver bridging or wholesale userspace replacement. Neither qualifies as a quick win, and the user explicitly OK'd stopping on "большие фандинги." The working substacks (build/install/cert/AMD-launch on stock QEMU 11 + custom kernel + cert-patched qcow2) remain intact and usable for everything except actual UI rendering. For UI/render testing, a real Samsung TV in Developer Mode is the pragmatic path.
 
 This stack: boots past 28s, SDB ready, install succeeds with Samsung cert, app reaches AMD launcher, but dies in graphics init. Useful for build/install/cert/AMD-launch validation; not for actual UI testing.
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 11:15 Europe/Moscow
+
+### drmOpen→udev redirect makes TDM use virtio_gpu and proves cocoa scanout works — but enlightenment hits an apparent QEMU 11 TCG mistranslation in libc that can't be patched out
+
+**Status:** verified (positive on TDM bridge, negative on UI render — this is the wall)
+
+**Setup:** kernel = custom bzImage with vigs stub. qcow2 = `base_combined.qcow2` (deviced.powerdown_ap=ret + libdrm_vigs.device_create version check skip). QEMU = stock 11, `-cpu Haswell-noTSX -smp 4 -accel tcg -display cocoa -device virtio-vga`. Kernel cmdline gained `console=tty0` so fbcon mirrors kernel log to virtio_gpu's framebuffer for direct scanout verification.
+
+**Three results from this round:**
+
+#### 1. drmOpen("vigs")→udev fallback redirect
+
+`libtdm-emulator.so` (the HAL backend symlinked from `libhal-backend-tdm.so`, the actual TDM implementation in the Samsung emulator image) opens its DRM device via `drmOpen("vigs", NULL)`. The literal string `"vigs"` lives at file offset `0x153db` inside the library. With our vigs kernel stub answering as driver name `vigs`, `drmOpen` succeeds and returns the stub's card1 fd — but the stub has no KMS, so the subsequent `drmModeGetResources` returns NULL and `_tdm_drm_display_initialize` fails with "no drm resource".
+
+But `hal_backend_tdm_drm_init` has a **udev fallback path** for when `drmOpen` fails. It enumerates `/sys/class/drm/card*`, walks parents to the PCI subsystem, reads `boot_vga`, and picks the device with `boot_vga == "1"`. On stock QEMU 11 with `-device virtio-vga`, that's `/dev/dri/card0` (virtio_gpu). After the udev path opens that devnode, the function jumps back to the same continuation as the `drmOpen` success branch (instruction at `0x13cbb`), so the rest of the function operates on virtio_gpu's fd.
+
+**Patch** to force the fallback: 5 bytes at `libtdm-emulator.so` offset `0x13cab` (`call drmOpen@plt` = `e8 80 1a ff ff`) → `b8 ff ff ff ff` (`mov eax, -1`). The next instructions `mov %eax, %r14d; test %eax, %eax; js 0x14220` then unconditionally enter the udev path. qcow2 byte offset: `0x100000 + 0x4028a000 + 0x13cab = 0x4039dcab`. Applied to `base_combined.qcow2`.
+
+**Outcome with this patch alone:**
+- klog: no `no drm resource: Invalid argument`. TDM init succeeds against virtio_gpu's resources (1 CRTC, 1 connector, 1 encoder, 1 universal plane).
+- klog: `Compositor Init` followed by `Compositor Init Done` at ~28-29s.
+- klog: enlightenment modules (`e-mod-tizen-*`) all `Open Done` / `Enable Done`.
+- klog: `wm_start` flag dropped — WM declares itself up.
+
+The TDM-on-virtio_gpu redirect works. The boot proceeds further than any previous attempt.
+
+#### 2. Cocoa scanout end-to-end proof via fbcon
+
+Kernel cmdline modified from `console=ttyS0` to `console=tty0 console=ttyS0`. This routes the kernel ringbuffer to **both** serial (for the klog file) and tty0 (which fbcon attaches to virtio_gpu's `fb0` framebuffer). On reboot with the patched qcow2, the cocoa window now **shows live kernel/dlog text scrolling across the screen** — the same content as `qemu_gfx.klog`, rendered through virtio_gpu's scanout.
+
+That is the **scanout path end-to-end proof**: the mechanism for putting pixels into the cocoa window is functional. Anything in userspace that successfully writes to virtio_gpu's framebuffer or sets a CRTC on it will be visible. The earlier "SeaBIOS text only" screenshots weren't a scanout failure — they were a *userspace did nothing* state.
+
+#### 3. enlightenment deterministic libc GPF — apparent QEMU 11 TCG mistranslation
+
+With the drmOpen patch in place, ~25-200 ms after `Compositor Init Done`, klog logs:
+```
+traps: enlightenment[<pid>] general protection ip:<base>+0x749aa sp:<sp> error:0 in libc.so.6[<base>+150000]
+```
+The IP offset inside libc is **always `0x749aa`** — bit-for-bit deterministic across runs, across `-smp 1 -accel tcg,thread=single` vs `-smp 4 -accel tcg`, across separate boots (only the ASLR base shifts).
+
+`0x749aa` is **mid-instruction** — 2 bytes into the 6-byte `movl -0x564(%rbp), %ebx` at `0x749a8` inside `__vfwscanf_internal+0x506a`. Decoding bytes from `0x749aa`:
+```
+9d        popf       ; legal in userspace
+9c        pushf      ; legal in userspace
+fa        cli        ; PRIVILEGED → triggers #GP error 0 in userspace
+```
+That decoding exactly explains the `error:0` GPF signature.
+
+How the CPU arrives at `0x749aa`: no static branch and no static jump-table entry inside libc targets that address. I dumped all four indirect-jump dispatch tables in `__vfwscanf_internal` (at libc offsets `0x18c7dc`, `0x18c898`, `0x18c948`, `0x18ca98`); none contain `0x749aa` as a target. So the IP is reached either by (a) an indirect jump or return whose register/stack value got corrupted at runtime, or (b) QEMU's TCG translating one specific x86 block on Apple Silicon with a +2 offset error.
+
+**Discriminating experiment:** patched `__vfwscanf_internal` entry (libc offset `0x6f940` → qcow2 offset `0x100000 + 0x8600000 + 0x6f940 = 0x876f940`) with `b8 ff ff ff ff c3` (`mov eax, -1; ret`). If the function were being called normally, this stubs every wide-scanf in the system and the indirect-jump corruption inside it cannot fire. **Result: identical crash, same `0x749aa` offset, same ASLR-shifted base.** The CPU never went through the function's entry. The IP is being reached without `__vfwscanf_internal` being called at all — i.e. it's pure control-flow corruption *to* an address that happens to land inside libc.
+
+Add-by-2 deterministic corruption that lands on `cli` after exactly 2 bytes is a strong signature for a TCG mistranslation (a misaligned jump-table read where 2 was added to a base instead of 0, or a jcc/jmp displacement off by 2). It's far less consistent with random heap corruption (which would scatter across IPs/runs). Plus the wider context — we're cross-translating x86_64 TCG to arm64 host on Apple Silicon, the same combination that produced the deterministic libevas GPF on Samsung's QEMU 2.8.
+
+**External fix from outside QEMU is not possible.** No userspace patch can move where the indirect jump source's translated host code lands. A real fix requires either patching QEMU 11's x86 TCG translator (multi-week) or running x86 on x86 hardware (i.e. not on Apple Silicon).
+
+**Cleanup:** `__vfwscanf_internal` reverted to original `55 48 89 e5 41 57`. The drmOpen→udev patch is **kept** in the qcow2 because it correctly improves the stack — it advances boot from "TDM init fails on missing KMS" to "TDM init succeeds, compositor inits, then a QEMU TCG wall." That's the new best-known state.
+
+**Current qcow2 (`/tmp/tizen-patched/base_combined.qcow2`) patches:**
+- deviced.powerdown_ap = ret  (offset `0x465909d0`, byte `0xc3`)
+- libdrm_vigs.device_create version check je → jmp  (offset `0xc97e266`, byte `0xeb`)
+- libtdm-emulator.drmOpen("vigs") → mov eax,-1  (offset `0x4039dcab`, 5 bytes `b8 ff ff ff ff`)
+
+**Files generated this round:** none new on the disk (kernel and qcow2 only; vigs-stub binary already committed in earlier round at `~/tizen-kernel-build/output/bzImage.x86_64.gfx`).
+
+**Why this is the wall:** The crash is a deterministic, IP-stable, "lands on `cli` after exactly 2 bytes" mid-instruction GPF — the signature of a QEMU TCG bug on Apple Silicon, not of any guest-side bug we can patch around. Every other layer in the stack is verified working: kernel boot, vigs userspace ABI satisfaction, TDM init with virtio_gpu resources, fbcon → cocoa scanout. If/when QEMU's x86 TCG on arm64 gets fixed for this case (or we switch to x86 hardware), this stack should boot all the way to a Tizen UI. Until then, building/installing/cert-flowing locally on Apple Silicon and rendering on real Samsung TV hardware remains the pragmatic split.

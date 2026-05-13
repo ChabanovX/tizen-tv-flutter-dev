@@ -570,3 +570,53 @@ Artifacts:
 **Next action:** User decision. Honest summary — display rendering needs either Samsung's vigs in QEMU (no public source) or a vigs↔virtio_gpu shim (significant kernel engineering). For developing Flutter Tizen TV apps on Apple Silicon today, the pragmatic stack is:
 1. This setup (custom kernel + patched deviced + stock QEMU 11) for build/install/cert validation
 2. Real Samsung TV in Dev Mode for actual UI/rendering testing
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 10:45 Europe/Moscow
+
+### libdrm_vigs single-byte patch unblocks device_create, but app still dies in launch — surface_create returns garbage from skipped ioctl
+
+**Status:** verified (negative — single-byte patch insufficient)
+
+**Finding:** Tried minimal byte-level patch to `libdrm_vigs.so.10.0.0`. Inside `vigs_drm_device_create` there's a DRM driver version check:
+```
+1262: cmpl $0xe, %r13d        ; expects vigs driver (version 14)
+1266: je 0x1290               ; success path
+```
+On virtio_gpu the driver version is 0, so the je is not taken and the function returns EINVAL.
+
+**Patch:** one byte at file offset 0x1266: `74 → eb` (je → jmp). Forces success regardless of detected driver version. Applied to `libdrm_vigs.so.10.0.0` at file offset 0xc87d000 in partition 0; new combined backing at `/tmp/tizen-patched/base_combined.qcow2` (deviced patch + libdrm_vigs patch).
+
+**Result:** Install works (~109s). The app launches via AMD (App Manager Daemon):
+```
+__on_app_fg_launch(639) > start timer for com.example.hello_tizen_tv(0)
+__pause_multi_user_target(617) > by com.example.hello_tizen_tv
+RESOURCED: block_prelaunch_state(157) > insert data com.example.hello_tizen_tv
+```
+But then dies in init:
+```
+AOT_MANAGER_SERVER: AOT failed to create ni under pkg root [com.example.hello_tizen_tv]
+__fg_launch_timeout(587) > com.example.hello_tizen_tv(0)
+__resume_multi_user_target(561) > by com.example.hello_tizen_tv
+```
+sdb forward list shows only 1 port (`tcp:57275 → tcp:57275`), and connecting to it gets RST — process never bound Observatory.
+
+**Why it's not enough:** Every other vigs_drm_* function (`surface_create`, `execbuffer_exec`, `fence_wait`, ~27 total) still calls `drmIoctl` with vigs-specific commands (e.g. surface_create uses `0xc0206441`), which virtio_gpu doesn't understand → EINVAL → function returns error → Tizen graphics chain (libtbm, EFL, libflutter_engine) dies.
+
+To go further would require patching each of ~27 vigs_drm_* functions to either fake success with reasonable output struct values, OR skip the ioctl call and synthesize the expected output. Each function's caller expects a specific struct layout populated; without that, dereferencing fields gives garbage and likely SIGSEGV.
+
+A more wholesale approach would be:
+- **Replace libdrm_vigs entirely** with a stub library that exports the same symbols but returns plausible fake data for everything. Days of work — need to understand each function's expected output struct shape, plus deal with handle uniqueness, fence semantics, etc.
+- **Write a vigs↔virtio_gpu kernel translator** driver. Probably even more work since vigs is a complete graphics stack (GEM, surfaces, fences, execbuffer).
+- **Port Samsung's vigs device** to QEMU 11+ (have source in emulator-kernel `include/drm/vigs_drm.h` + driver code). The "right" answer, multi-week.
+
+**Why this is a stopping point:** Single-line patches don't unblock display anymore. The remaining work is wholesale userspace stubbing or kernel-level reverse engineering — both multi-day at minimum.
+
+**Confirmed working stack (current best):**
+1. Custom kernel with virtio-gpu (`docs/kernel-build/bzImage.x86_64.gfx`)
+2. Patched qcow2 backing with deviced.powerdown_ap = ret AND libdrm_vigs.device_create version check bypassed (`/tmp/tizen-patched/base_combined.qcow2`)
+3. Stock QEMU 11 + Cocoa display
+
+This stack: boots past 28s, SDB ready, install succeeds with Samsung cert, app reaches AMD launcher, but dies in graphics init. Useful for build/install/cert/AMD-launch validation; not for actual UI testing.

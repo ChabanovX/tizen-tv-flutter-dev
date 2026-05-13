@@ -1535,6 +1535,27 @@ User re-fired `/loop` after the iteration 2 wakeup; further iteration produced c
 
 **Net of iteration 3+:** the *real* remaining options narrow to one binary patch on enlightenment-real (skip the `E_Comp_Canvas Init Failed` abort — likely a single conditional in `e_comp.c` linked code) OR cross-compile Mesa-virgl. The binary patch is days of RE work on the unstripped 2.8 MB enlightenment binary; identifying the exact bail spot requires symbol cross-reference of `e_comp_canvas_init` calling `ecore_evas_new` and the post-check that triggers shutdown. The Mesa path is more deterministic but requires a Tizen sysroot we don't have locally.
 
+### Iteration 4 — 2026-05-13 — Binary patch made compositor reach MAIN LOOP at 0.31s
+
+The "days of RE work" turned out to be 30 minutes. The exact failure was localized:
+
+**Function**: `e_comp_screen_init` (text VMA 0x448460, file offset 0x48460 in enlightenment-real).
+
+**Failure path**: after `EE_SOFTWARE_TBM New Done` succeeds, the code at VMA 0x4489dd calls `_e_hwc_windows_target_window_queue_set(r15)`. If it returns 0 (HWC plane queue setup failed — which it does on virtio_gpu because of limited plane support), the `je 0x449622` at VMA 0x4489e4 takes control to a log+cleanup block that prints "E_Comp_Canvas Init Failed" at 0x4496a3 and shuts down.
+
+**Patch**: 6 bytes at VMA 0x4489e4 (file offset 0x489e4): `0f 84 38 0c 00 00` (je 0x449622) → `90 90 90 90 90 90` (6× NOP). The HWC check is bypassed; flow falls through to the eventfd-handler + canvas-render-listener setup which doesn't require HWC.
+
+**Result with patch + LD_PRELOAD drm_planes_shim**:
+- `MAIN LOOP AT LAST` at ESTART 0.31s (vs prior unreachable)
+- `/run/wayland-0` socket created in <1s
+- DEFERRED inits run (DPMS, Dnd, Scale, Test_Helper, INFO_SERVER, E_Server, E_Module)
+- All Tizen TV modules load (e-mod-tizen-wm-policy, e-mod-tizen-virtualscreen-tv, e-mod-tizen-screensaver, e-mod-tizen-video-tv, e-mod-tizen-keyrouter-tv, e-mod-tizen-gesture, e-mod-tizen-tvs-helper-tv, e-mod-tizen-cursormgr-tv, e-mod-tizen-processmgr)
+- First-after-boot launch reliably reaches MAIN LOOP. Subsequent launches sometimes fail at `E_Server Init Failed` (stale state from prior compositor instance — needs further investigation).
+
+**Patched binary saved**: `docs/static-fb-test/enlightenment-patched` (2.8 MB). Apply at runtime by pushing to /tmp/, chsmack "*", chmod +x, run with the same env+LD_PRELOAD as enlightenment-real.
+
+**Next wall (likely)**: with compositor up, Flutter Tizen embedder loads, attempts `eglCreateWindowSurface` against the VIGS-only libEGL. That's expected to fail (same Mesa-virgl story). But we still haven't seen Flutter render — when we last sequenced "compositor launch + Flutter launch", enlightenment died ~12s in (likely SIGSEGV in a Tizen-extension protocol handler). Need to capture the next-fault site to understand whether (a) it's Tizen-Wayland protocol related or (b) it's the expected EGL failure.
+
 ### Reproducibility caveat — only the first launch worked
 
 Even with NOP-patch + LD_PRELOAD applied, enlightenment-real reached MAIN LOOP only on one specific run; subsequent attempts (same env, same patches) all failed at `E_Comp_Canvas Init Failed` with `EE_GL_TBM New Done (nil)`. After a full QEMU reboot, the next attempt also fails the same way. Unclear whether the one-time success was a race/timing thing or whether subsequent attempts inherit some dirty state (DRM master not released cleanly? EGL display cached?). Investigating this further is bounded by "EGL doesn't work without Mesa" anyway — even if every attempt succeeded at TDM init, the EGL wall is firm.

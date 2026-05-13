@@ -805,3 +805,119 @@ None of those three are fixable with qcow2 byte patches.
 **Final state:** `base_combined.qcow2` keeps the three working patches (deviced.powerdown_ap=ret, libdrm_vigs.device_create version-check skip, libtdm-emulator.drmOpen("vigs")→mov eax,-1). All libc patches reverted. Boot reproducibly reaches `Compositor Init Done` + enlightenment GPF; cocoa shows kernel log via fbcon for ~30 seconds before WM-dependent daemons time out and the system gives up.
 
 **Conclusion of this loop pass:** every reasonable single-byte / single-block in-place patch to libc has been tried and ineffective. To progress further, we'd need to either (a) move to x86 hardware, (b) build a custom QEMU with the TCG fix, or (c) install a Tizen-side debugging app that can rewrite libc pages from inside the running guest (requires a TPK with platform privileges, which would require a Samsung platform cert we don't have). All three are out of scope of "byte patch + boot + observe" iteration.
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 13:05 Europe/Moscow
+
+### Pixel-write path through cocoa is functional — verified by replacing enlightenment launch with `cat /dev/urandom > /dev/fb0`
+
+**Status:** verified positive
+
+**Setup:** patched `/usr/bin/run_enlightenment.sh` inside qcow2 at offset `0x7a2f1541` (65-byte in-place replacement of the enlightenment launch line `/usr/bin/chrt --fifo 22 /usr/bin/enlightenment > /dev/kmsg 2>&1 &`). Two variants tested:
+1. `/bin/dd if=/dev/urandom of=/dev/fb0 bs=4M count=4;/bin/sleep 99 #`
+2. `echo 0>/sys/class/vtconsole/vtcon1/bind;cat /dev/urandom>/dev/fb0`
+
+Boot to `Compositor Init Done` ~ 28s (no enlightenment launched, no libc 0x749aa GPF). klog shows the dd / cat executed and hit either "File too large" or "No space left on device" once they filled fb0's 720×400×4 ≈ 1.15 MiB. Then `screendump` via the QEMU monitor was taken; PPM file converted to PNG and inspected.
+
+**What the screenshot shows:** the cocoa window contains scrolling kernel/dlog text from fbcon AND a clearly visible narrow vertical strip of random multicolored noise pixels along the left edge that fbcon does not overwrite (~50 px wide column of pure RNG). Pixel-byte histogram: 15% non-zero, with 256 distinct byte values present, dominated by entropy-distributed bytes (0xaa second-most-common is just an artifact of urandom block alignment to the BGRA pixel layout).
+
+That narrow noise column is the strongest evidence — visually, those pixels are not part of fbcon's text grid and they only appear when a userspace `cat`/`dd` to `/dev/fb0` runs. Consistent with: **bytes written to `/dev/fb0` from userspace reach the cocoa display sink**. Caveat: the histogram alone is weaker (the 256 distinct byte values include a heavy 0 + 0xaa dominance from fbcon's overlay, with only ~2% of bytes spread across the rest), so the visual left strip is doing most of the work here.
+
+The earlier puzzle ("can `screendump` ever show anything other than the SeaBIOS boot screen?") is also addressed — virtio_gpu's fbdev scanout drives the cocoa window in real time. fbcon writes kernel-log text via tty0 (when `console=tty0` is on the cmdline), so on an unpatched boot we still see only kernel text or the leftover SeaBIOS text; the userspace-write path is exercised only when something other than fbcon writes fb0.
+
+**Resolution mode caveat:** the screenshots are 720×400 (VGA text-mode dimensions × 9×16-px char cells = 90×25). virtio_gpu's `fb0` stays in this 720×400×32bpp mode for the whole boot because nothing calls `drmModeSetCrtc` with a higher mode. The kernel cmdline `video=LVDS-1:1920x1080-32@60` is ignored — virtio_gpu's connector is named `Virtual-0`, not `LVDS-1`. To get HD pixels we'd need either a `video=Virtual-0:1920x1080-32@60` override, a fbset call, or a real KMS modeset from userspace. Not done — for the pixel-path proof, 720×400 is sufficient.
+
+**`vtcon1/bind` unbind path:** the `echo 0>/sys/class/vtconsole/vtcon1/bind` variant doesn't fully stop fbcon from refreshing during cat — empirically the cat-then-text overlay still happens, suggesting either (a) `vtcon0` (built-in VGA console) is the active console binding, not `vtcon1`, or (b) the unbind is racy with fbcon's own writer thread. The left-edge noise survives anyway because fbcon's character-grid renderer doesn't touch the leftmost few pixel columns.
+
+**Why this matters:**
+- The display wall is **not** a hardware/QEMU/scanout problem — pixels DO reach cocoa from userspace writes.
+- The display wall is specifically Tizen's compositor (enlightenment) not running due to the `libc+0x749aa` deterministic GPF.
+- Any Tizen app that draws to fb0 (or via DRM dumb buffer + drmModeSetCrtc on virtio_gpu's `card0`) without going through enlightenment would be visible.
+- This **does NOT** reframe "make a Flutter Tizen TV app render" — Flutter binaries dynamically link the same glibc and will exercise the same x86 TCG block that mistranslates. The reframe is narrower: "a *static* binary or a non-glibc renderer (musl-linked, or a kernel-side test) writing fb0 would be visible," which is useful for sanity-checking pieces in isolation but doesn't unblock the Flutter Tizen TV target on Apple Silicon.
+
+**Cleanup:** `/usr/bin/run_enlightenment.sh` restored to original 65 bytes at offset `0x7a2f1541`. qcow2 patches unchanged.
+
+**Files generated this round:** `/tmp/tizen-utm/fb0_test.png` and `/tmp/tizen-utm/fb0_test2.png` — proof screenshots, retained for documentation.
+
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 13:13 Europe/Moscow
+
+### Samsung TV kernel modules are not in the public Tizen git — option (b) is a dead end
+
+**Status:** verified negative
+
+**Question:** is the source for the kernel module that creates `/proc/vd_signal_policy_list` (and related Samsung-TV-specific code) on `git.tizen.org`?
+
+**Method:** queried `https://git.tizen.org/cgit/?q=<keyword>&qt=name` for every plausible keyword: `vd_signal`, `vd-signal`, `signal_policy`, `vd_signal_policy`, `vd_signal_policy_list`, `tv-modules`, `tv-kernel`, `power-policy`, `e-mod-tizen-tv`, `enlightenment-tv`. Also crawled the full project list (3822 distinct repos at offset 0..5000).
+
+**Results:**
+- No repo contains `vd_signal*` or `signal_policy*` in its name.
+- Only TV-related public repos: `platform/core/system/plugin/deviced-tv`, `profile/tv/*` (12 apps + meta/model/uifw), `platform/upstream/enlightenment`. None build the missing kernel module.
+- **`deviced-tv` is an "Initial empty repository"** — `git log --oneline` shows only the seed commit `37ff52a Initial empty repository` on the `tizen` branch. The actual Samsung TV power/signal plugin code was never pushed to the public mirror.
+- `platform/kernel/emulator-kernel` is the public emulator kernel base (already used as our kernel build source). It does not contain Samsung TV's signal-policy module.
+
+**Conclusion:** Samsung TV-specific kernel and userspace code (signal_policy module, TV deviced plugins) is **closed source** and only ships as binaries inside Tizen TV emulator images. Rebuilding the kernel with these modules from public source is not possible.
+
+The two "Next actions" originally proposed in the previous round (a) signal_policy_list userspace fix and (b) find TV-modules source are both effectively closed:
+- (a) was already obsoleted earlier — the actual poweroff trigger was `deviced.powerdown_ap`, which is patched to `ret` in `base_combined.qcow2`. The `signal_policy_list` write in `run_enlightenment.sh` fails harmlessly.
+- (b) is impossible — the upstream source doesn't exist.
+
+The real remaining wall is unchanged: the deterministic libc `+0x749aa` GPF inside `enlightenment`, attributable to a QEMU 11 x86→arm64 TCG mistranslation on Apple Silicon. See the previous two findings.
+
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 13:19 Europe/Moscow
+
+### Narrowing the libc 0x749aa wall: it's not a general libc bug, and the function it lands in isn't even called
+
+**Status:** new isolation results — narrows the QEMU TCG bug scope significantly
+
+Three new experiments this round:
+
+#### 1. `/bin/ls -lR / > /dev/kmsg` runs to completion — libc is not broken
+
+Replaced the enlightenment launch in `run_enlightenment.sh` (qcow2 offset `0x7a2f1541`, 65 bytes) with `/bin/ls -lR / > /dev/kmsg 2>&1;sleep 99…` and booted.
+
+**Result:** `/bin/ls` runs cleanly for ~10+ seconds, recursively traversing the entire filesystem, calling thousands of `lstat`/`readlink`/`getdents`/`fprintf`/`stat`/`memcpy` paths through the **same** Tizen libc. **Zero `general protection` faults**. klog output includes hundreds of legitimate `ls` warnings like `/bin/ls: cannot read symbolic link /proc/1207/task/1207/exe: No such file or directory` — printed via libc's stderr / formatted-output path.
+
+This conclusively rules out: "libc.so.6 itself is broken under QEMU 11 TCG on Apple Silicon." It runs fine for normal programs. The QEMU TCG mistranslation is specific to **the code path enlightenment exercises**, not a wholesale libc issue.
+
+#### 2. The crash IP `0x749aa` lives inside `vfwscanf@GLIBC_2.2.5`, but enlightenment never calls vfwscanf
+
+`nm -D` on Tizen's libc.so.6 returns (filtered to the relevant range):
+- `vfwscanf @@GLIBC_2.2.5` at `0x6f810`
+- (no exported symbol between)
+- `vprintf @@GLIBC_2.2.5` at `0x77150`
+
+Crash IP `0x749aa` = `vfwscanf+0x4198`, well inside vfwscanf's body (function spans 0x6f810..0x77150).
+
+But `nm -D /tmp/enlightenment.bin | grep -i scanf` returns: `fscanf`, `__isoc23_sscanf`. **No `vfwscanf` import**, no `wscanf` import, no wide-character scanf usage in enlightenment's symbol table.
+
+So the bad indirect jump that lands at `0x749aa` is **not a call to vfwscanf** — it's a corrupted jump that just happens to land inside vfwscanf's address range. The function name in the GPF report (`in libc.so.6[base+...]`) is a red herring; the kernel just reports whichever VMA the IP falls into.
+
+#### 3. No 4-byte value in any of libc's text/rodata equals `0x749a8` or `0x749aa` (under any plausible base)
+
+Exhaustive scan of `libc.so.6` for any 4-byte little-endian value that, when interpreted as a relative offset from its own file position, equals `0x749a8` (legitimate instruction at `mov -0x564(%rbp), %ebx`) or `0x749aa` (mid-instruction `popf; pushf; cli`): zero matches. Likewise scan of the four known indirect-jump tables in vfwscanf (offsets `0x18c7dc`, `0x18c898`, `0x18c948`, `0x18ca98`): zero matches.
+
+The target address is **computed at runtime**, not stored anywhere on disk.
+
+#### Implication for the bug shape
+
+The corruption signature now reads: an indirect branch with a runtime-computed target lands 2 bytes past a legitimate instruction inside a function that is **never actually called** during enlightenment's startup. The most consistent explanation remains: **QEMU 11 TCG x86→arm64 host-code mistranslation of an arithmetic-on-register sequence that enlightenment exercises**, producing `correct_target + 2` instead of `correct_target`. Why "correct_target" should be inside vfwscanf at all is unclear — could be a stale jump-target cached in a register from prior wide-char setup (locale init perhaps), or a coincidence of address-arithmetic on a base pointer.
+
+We don't have a non-destructive way to find the SOURCE of the indirect jump without QEMU instruction-level tracing (which is multi-GB/s output, not a feasible local diff). The remaining productive angles all require code:
+
+1. **Build QEMU 12-dev (or pull a TCG-bugfix patch from qemu-devel) and re-test** — multi-hour build but realistic.
+2. **Stripped-down repro on x86 hardware** — copy this qcow2 + custom kernel to an x86 Linux box, run stock `qemu-system-x86_64 -accel kvm`. If the bug is gone, it confirms TCG-on-arm64 root cause. If it persists, it's a different issue entirely.
+
+#### Net effect on display strategy
+
+The path through `/dev/fb0` is functional. Tizen userspace mostly works (only enlightenment hits this specific TCG bug). For Flutter Tizen TV development on Apple Silicon, the practical conclusion stays unchanged: render-test against real Samsung TV hardware in Developer Mode; use this stack for build/install/cert/AMD-launch validation only.
+

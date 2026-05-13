@@ -1385,3 +1385,44 @@ Looped every ~2 s indefinitely; PID counter incremented from 14200+ → 14600+ i
 
 **Stack additions this iteration:** no qcow2 patches; only methodology change (push to canonical path bypasses realpath issue).
 
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 15:55 Europe/Moscow
+
+### Final wall: Flutter Tizen needs a Wayland display, our stack doesn't provide one
+
+**Status:** decisively walled
+
+**Setup:** SDB device ready, sdb shell works, sdb push to canonical /opt/usr/home/... path completes in 22 s, pkgcmd install finishes `key[end] val[ok]` in 19.5 s. App installed to `/opt/usr/apps/com.example.hello_tizen_tv/`. `aul_test launch com.example.hello_tizen_tv` returns PID. AMD signals `lwipc: [amd] D '/tmp/app_running'`.
+
+**Then it dies:**
+```
+E/LAUNCHPAD: app_executor.cc: OnExecution(188) > Execute application(/usr/bin/dotnet-launcher)
+E/DOTNET_LAUNCHER: plugin-util.cpp: GetTPARO(378) > access TPA RO file errno: No such file or directory
+E/DOTNET_LAUNCHER: window-base-ecore-wl2.cpp: CreateInternalWindow(3546) > Failed to get display, then application will be exit
+E/ConsoleMessage: flutter_tizen_engine.cc: RunEngine(117) > The display was not valid.
+E/AMD: app_status_manager.cc: OnSigchldEvent(1124) > appid(com.example.hello_tizen_tv), pid(3868), status(11)
+```
+
+Then `dotnet-loader-inhouse` respawn-loops every ~2 s indefinitely (PIDs 6373 → 6468 → 6530 → 6583 …) on the same chain of errors.
+
+**The actual wall:**
+
+Flutter Tizen TV uses the **`ecore-wl2`** EFL backend (Wayland 2). The first thing the embedder does in `CreateInternalWindow()` is `wl_display_connect()` to talk to the Wayland compositor. With `wmreadypoke` replacing `/usr/bin/enlightenment`, there is **no Wayland compositor running**, so `wl_display_connect()` returns NULL and the app exits with `RunEngine() > The display was not valid`.
+
+The Wayland socket lives at `/run/wayland-0` (or similar) and is created by enlightenment when it starts. wmreadypoke fires lwipc events to claim WM is up but doesn't actually create the Wayland socket. Tizen apps that don't need graphics (services, daemons) come up fine; anything graphical needs a real Wayland server.
+
+**Paths forward, in increasing scope:**
+
+1. **Build a minimal Wayland compositor that just provides `wl_display`** — Weston in DRM/KMS mode (1-2 day project, would need cross-compile or find a prebuilt static binary). Substitute it in qcow2 the same way we substituted wmreadypoke. Should let Tizen apps connect and render to fb0 directly.
+2. **Patch the dotnet-launcher / flutter-tizen embedder to use fbdev backend instead of wl2** — would let Flutter draw to fb0 without Wayland. Requires either rebuilding Flutter Tizen embedder or finding a runtime flag that switches backends.
+3. **Fix the libc TCG bug at +0x749aa** — multi-week QEMU upstream work; eliminates the need for wmreadypoke substitution entirely.
+
+**Net for "Flutter Tizen TV apps render on Apple Silicon today":** unreachable on this stack without one of those three. The discovery+install+launch pipeline is fully functional; the rendering layer specifically requires a Wayland compositor we don't have.
+
+**Pragmatic recommendation (unchanged from earlier):** build/sign/install/launch locally on Apple Silicon (everything but render — works), render on real Samsung TV hardware in Developer Mode.
+
+**Saved artifact:** `docs/static-fb-test/fb0_final_with_install.png` — 1920×1080 screenshot of cocoa at the moment the dotnet-loader is in the respawn-loop. Shows kernel/dlog text overlaid on the black framebuffer; no Flutter UI is rendered because the app exits before reaching its draw step.
+

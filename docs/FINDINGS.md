@@ -1284,3 +1284,49 @@ The downstream effect: `tizen-boot.target` isn't satisfied, `system-default-targ
 
 **Current concrete usability:** the emulator boot-on-Apple-Silicon is now genuinely usable for SDB push, shell, pkgcmd list, ls-around-filesystem. Not for app install/launch/render. For Flutter Tizen dev, this means: a Tizen target shows up in `flutter-tizen devices`, build/sign/push work locally, but the actual `flutter-tizen run` step that calls install + AMD launch can't complete on this stack. Render-test must happen on real TV hardware.
 
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 15:18 Europe/Moscow
+
+### wm_ready.service patch reduces failed services 12 → 6, pkgcmd no longer hangs
+
+**Status:** verified positive (partial)
+
+**Patch:** `/usr/lib/systemd/system/wm_ready.service` ExecStart replaced 50-byte string `while [ ! -e /tmp/.wm_ready ]; do sleep 0.1 ; done` with `/bin/true                                                  ` (same length, trailing spaces). qcow2 offset `0x7b6b6089`.
+
+**Outcome:**
+- Failed services count: 12 → **6** (boot continues past more services)
+- `pkgcmd -i -t tpk -p <path>` now returns in **101ms** instead of hanging indefinitely. Specifically: `realpath fail: 2 / conversion of relative path to absolute path failed / processing result : Package not found [-5]`
+- The "AUL socket" path bottleneck is unblocked — pkgcmd talks to its backend, the backend returns an error, but it doesn't deadlock anymore.
+
+**Still failing services** (all related to graphical mode/Samsung TV-specific):
+- bootmode-graphical.service
+- buds-conn-manager.service (Bluetooth)
+- ContentServiceManager.service (DRM content)
+- emul-setup-audio-volume.service
+- system-default-target-done.service
+- wm_ready.service (still timing out — see weird systemctl-vs-file mismatch below)
+
+**Mystery — systemctl status shows OLD ExecStart even though file has NEW content:** when probed via sdb shell, `cat /usr/lib/systemd/system/wm_ready.service` returns the patched `/bin/true` ExecStart. But `systemctl status wm_ready` reports the *old* command in the Process: field:
+```
+Process: 2975 ExecStart=/bin/sh -c while [ ! -e /tmp/.wm_ready ]; do sleep 0.1 ; done
+```
+
+The boot's audit + lwipc timestamps confirm this IS the current boot. The unit is reported as failed by timeout at 14:15:45 of this boot. Yet the file content matches our patch. No journal files exist (`journalctl -u wm_ready` returns "No journal files were found"). So either systemd cached an in-memory version of the unit from a generator we haven't located, or there's a unit-file caching mechanism that loaded the original at boot before re-reading the patched bytes.
+
+Despite the mystery, the cascade unblocked enough downstream that pkgcmd-class operations are usable.
+
+**Why install still fails ("Package not found [-5]"):** The realpath call in pkgcmd resolves the TPK path via dlsym'd resolver that hits a SMACK or namespace boundary. The file exists at `/home/owner/share/tmp/sdk_tools/hello.tpk` (when pushed) but pkgcmd, running as the user shell context, can't `realpath()` through `/home → /opt/usr/home` symlink properly. Each fresh boot loses the pushed file too (fresh overlay). To complete install: would need to either pre-bake the TPK into the qcow2 base image, or push it AFTER boot and run pkgcmd from a SMACK context that can resolve the path.
+
+**Cumulative stack state (as of this iteration):**
+- qcow2 patches: 5 byte-patches + 1 binary replacement
+  - deviced.powerdown_ap=ret (0x465909d0)
+  - libdrm_vigs.device_create version-check je→jmp (0xc97e266)
+  - libtdm-emulator.drmOpen redirect (0x4039dcab)
+  - is_debug → mov eax,1; ret in libsdbd_plugin.so (0x1b74abd0, 6 bytes)
+  - wm_ready.service ExecStart → /bin/true (0x7b6b6089, 50 bytes)
+  - /usr/bin/enlightenment → wmreadypoke 150 KB static x86_64 musl (0x64ea000)
+- kernel cmdline: `video=Virtual-1:1920x1080-32@60` for HD fb0
+

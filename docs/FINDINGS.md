@@ -1563,6 +1563,19 @@ The "days of RE work" turned out to be 30 minutes. The exact failure was localiz
 2. **Cocoa output binding** (legacy fb0 → DRM scanout): TDM needs to issue `DRM_IOCTL_MODE_SETCRTC` with the compositor's framebuffer. Possible to fake via QEMU monitor `screendump` for DRM scanout if it exists
 3. **Flutter EGL** (VIGS → Mesa-virgl): the long-known wall
 
+### Iteration 5 — 2026-05-13 — Cocoa-output-binding wall isolated
+
+**virtio-gpu-pci vs virtio-vga test**: changed `-device virtio-vga` → `-device virtio-gpu-pci` in `start-with-gfx.sh`. With virtio-gpu-pci (no legacy VGA): cocoa shows kernel-early "Decompressing Linux... Booting the kernel." text but freezes there — no SeaBIOS header at top (the giveaway for legacy VGA mode). With virtio-vga: cocoa shows SeaBIOS+iPXE+decompress header. Both freeze and never show the compositor output, even with enlightenment-patched alive + `/run/wayland-0` + all modules loaded.
+
+**Conclusion on cocoa-binding wall**: TDM/enlightenment never issues `DRM_IOCTL_MODE_SETCRTC` with the compositor's framebuffer attached. They render into TBM software buffers (`EE_SOFTWARE_TBM`) but never call `tdm_output_commit_page_flip` or equivalent to put those buffers onto the active DRM scanout. So cocoa keeps showing whatever was the initial kernel scanout (fbcon's early text). Fixing requires one of:
+- (a) Repair the HWC plane setup so `_e_hwc_windows_target_window_queue_set` returns success (currently bypassed via the 0x489e4 NOP patch, but the HWC state stays uninitialized — that's why no page-flip happens downstream)
+- (b) Patch enlightenment to use the `ecore_drm` engine instead of `software_tbm` — direct DRM scanout path
+- (c) Add a small page-flipper daemon that takes whatever buffer enlightenment composes and SETCRTCs it
+
+**E_Server Init Failed intermittency partial root cause**: on the second launch attempt with the same QEMU running, `e_comp_wl_init()` inside `e_server_init` returns NULL. Subsequent dlog shows other processes' WLLOG errors (`connect() failed: socket path(/run/wayland-0)`) accumulating, suggesting deviced/avocd/tvs-lite daemons hold some shared state that prevents a fresh Wayland-server bind. Workaround: only run the patched compositor as the FIRST compositor launch per boot.
+
+**Begin-Shutdown trigger localized**: enlightenment's `_e_main_shutdown` (text VMA 0x43faa0) is called from 4 sites — all inside `main()`. Three are CLI-arg handlers (irrelevant), the fourth is at 0x43bed7 — the **post-main-loop cleanup**. That means main loop EXITS (via `ecore_main_loop_quit`) and then main() falls through to shutdown. Quit callers: `_e_main_cb_signal_hup` (0x43f5f0), `_e_main_cb_signal_exit` (0x43f600), and a DBus method handler at 0x55ebd0. The exit-cb fires on SIGINT/SIGTERM/SIGQUIT. Most likely a Tizen daemon (tvs-lite waiting on `/run/.wm_ready`, or amd, or deviced) sends one of those signals after a timeout. Workaround for indefinite uptime: ignore those signals at process level (LD_PRELOAD an `sigaction` interceptor that filters them) OR have the SDB-shell launcher run under `nohup ... <&-` plus the env `SHELL_SIG_FILTER`-style trick.
+
 ### Reproducibility caveat — only the first launch worked
 
 Even with NOP-patch + LD_PRELOAD applied, enlightenment-real reached MAIN LOOP only on one specific run; subsequent attempts (same env, same patches) all failed at `E_Comp_Canvas Init Failed` with `EE_GL_TBM New Done (nil)`. After a full QEMU reboot, the next attempt also fails the same way. Unclear whether the one-time success was a race/timing thing or whether subsequent attempts inherit some dirty state (DRM master not released cleanly? EGL display cached?). Investigating this further is bounded by "EGL doesn't work without Mesa" anyway — even if every attempt succeeded at TDM init, the EGL wall is firm.

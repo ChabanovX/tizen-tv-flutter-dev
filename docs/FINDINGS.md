@@ -1450,6 +1450,81 @@ The `/loop продолжай работу над display эмулятора` se
 
 **No further productive iterations are available without one of the multi-day projects above or hardware access.** The pipeline-up-to-render is fully working (sign/push/install/launch in ~6 s once the SDB handshake is up); only the rendering layer is blocked by the absence of a Wayland compositor.
 
+---
+
+## Loop iteration 2 — 2026-05-13 (after re-fire of `/loop`)
+
+User re-invoked the same `/loop` despite the prior terminus. Mandate: keep working — "multi-day project" alone isn't grounds to stop. Outcome of this iteration: **the previously-named "QEMU TCG bug at libc+0x749aa" turned out to be a red herring, and the real blocker is a different one.**
+
+### The libc+0x749aa "QEMU TCG bug" was misdiagnosed
+
+What previously looked like a privileged-instruction misalignment in libc was actually **`rt_sigreturn` restoring a corrupted IP from the kernel-saved signal frame** after enlightenment's own SIGSEGV handler ran. Direct evidence: `/proc/PID/mem` of a fresh process showed bytes `90 90 ff ff` at libc+0x749aa (after we patched them), yet the kernel trap log still reported `general protection ip:...+0x749aa`. NOPs don't fault. So the kernel-reported IP is not the actual fault site. strace tells the truth: the first SIGSEGV fires with `si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=NULL`, enlightenment's `rt_sigaction(SIGSEGV, sa_handler=0x5490a0, sa_flags=SA_RESTORER|SA_NODEFER|SA_RESETHAND|SA_SIGINFO)` handler catches it, calls `rt_sigreturn`, and the second SIGSEGV (uncaught — `SA_RESETHAND` already cleared the handler) is what the kernel `traps:` line reports. The IP of that second fault is whatever rt_sigreturn restored, which is some random/corrupted value that happens to fall inside libc's range. **No QEMU TCG bisection is needed.**
+
+### The real first-fault site: TDM hal_backend init failure → NULL deref in cleanup
+
+`strace -s 300` of `/tmp/enlightenment-real` shows the syscall sequence right before the first SIGSEGV:
+
+```
+openat("/dev/dri/card0", O_RDWR|O_CLOEXEC) = 51
+ioctl(51, DRM_IOCTL_MODE_GETRESOURCES, ...) = 0
+ioctl(51, DRM_IOCTL_MODE_GETPLANERESOURCES, ...) = 0
+writev(5, [..."[hal_backend_tdm_drm_init 463]Get the master drm_fd(51)!"...]) = 79
+ioctl(51, DRM_IOCTL_VERSION, ...) = 0
+ioctl(51, DRM_IOCTL_MODE_GETRESOURCES, ...) = 0
+ioctl(51, DRM_IOCTL_MODE_GETPLANERESOURCES, ...) = 0
+writev(5, [..."[_tdm_drm_display_initialize 341]no drm plane resource"...]) = 76
+writev(5, [..."[hal_backend_tdm_drm_init 468]fail to _tdm_drm_display_initialize!"...]) = 89
+writev(5, [..."[hal_backend_tdm_drm_init 565]init failed!"...]) = 64
+writev(5, [..."[hal_backend_tdm_drm_exit 390]deinit"...]) = 58
+--- SIGSEGV ---
+```
+
+**virtio_gpu in this kernel returns 0 from `DRM_IOCTL_MODE_GETPLANERESOURCES` unless the client first sets `DRM_CLIENT_CAP_UNIVERSAL_PLANES=1`** — which `libhal-backend-tdm.so` (the TDM-DRM backend, an alias for `libtdm-emulator.so`) does **not** do. The function `_tdm_drm_display_initialize` at file offset 0x13610 checks `if (count_planes == 0) goto fail` at offset 0x136d2 (`0f 84 60 01 00 00` = `je 0x13838`), and on failure calls `hal_backend_tdm_drm_exit`, which dereferences a NULL plane-list pointer in cleanup, generating the first SIGSEGV.
+
+### Working workaround: LD_PRELOAD shim that sets the universal-planes cap
+
+`docs/static-fb-test/drm_planes_shim.c` — a glibc-linked shared library that interposes `drmModeGetPlaneResources(fd)`. Before delegating to the real libdrm function via `dlsym(RTLD_NEXT, ...)`, it issues `ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, {DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1})`. virtio_gpu then returns the primary plane (count=1), TDM init succeeds, `e_display_init Done` is reached, and the Wayland socket `/run/wayland-0` is created. Verified: at least one launch reached `ESTART: 8.82457 - MAIN LOOP AT LAST` followed by `e-mod-tizen-wm-policy Module Open`. Built with Debian 12 glibc inside Docker: `docker run --platform linux/amd64 -v ~/preload:/work debian:12 bash -c "apt-get update && apt-get install -y gcc && gcc -fPIC -shared -O2 -o drm_planes_shim.so drm_planes_shim.c -ldl"`.
+
+### Next wall behind that one: no EGL driver works on virtio-gpu
+
+After the TDM init unblock, enlightenment proceeds into `E_Comp_Canvas Init` which calls `EE_GL_TBM New` (EFL's GL-on-TBM ecore_evas backend). This **takes ~6 seconds and returns `(nil)`** — EGL/GL initialization fails on virtio_gpu. Software fallback `EE_SOFTWARE_TBM New Done 0x... 1920x1080` succeeds, but `E_Comp_Canvas Init` still fails (`E_Comp_Screen Init Failed → INIT FAILED → Begin Shutdown Procedure!`). Root cause:
+
+- `/usr/lib64/libEGL.so.1.4` (52 KB) is a Tizen wrapper.
+- `/usr/lib64/driver/libEGL.so.1.0` (122 KB) is the real driver, and `grep -ao "vigs\|virtio\|virgl\|mesa\|swrast" /usr/lib64/driver/libEGL.so.1.0` returns only `vigs`. It's a VIGS-only EGL implementation.
+- With VIGS unavailable (`/dev/vigs` doesn't exist; our libtdm-emulator patch makes `drmOpen("vigs")` fail so virtio-gpu is used instead), the real EGL has no GPU to talk to → returns NULL on context creation.
+- `/etc/profile.d/efl.sh` pins `ELM_ACCEL=gl ELM_ENGINE=gl` — software EFL isn't an option.
+
+There is no Mesa DRI directory (`/usr/lib64/dri/` doesn't exist), and the driver/libEGL doesn't speak virgl. **The compositor cannot get a working GL context without either a working VIGS kernel module + paravirtualized VIGS server, or a Mesa build with virgl support cross-compiled for Tizen TV.**
+
+### What this iteration accomplished
+
+| Before this iteration | After this iteration |
+|----------------------|---------------------|
+| "Real enlightenment crashes with QEMU TCG bug at libc+0x749aa — need to bisect QEMU or fork the embedder" | "Real enlightenment hits TDM init failure due to virtio_gpu plane discovery; we have a working LD_PRELOAD shim that bypasses that. The next wall is EGL, which on this image is VIGS-only." |
+| 3 unproductive multi-day projects on the table (QEMU bisect, embedder fork, Weston cross-compile) | 1 productive multi-day project on the table: cross-compile Mesa-virgl for Tizen TV. The other two are no longer relevant. |
+| Pipeline reaches "TPK installed + AUL launches PID" but compositor never up | Pipeline reaches "**Wayland socket /run/wayland-0 exists and enlightenment reached MAIN LOOP** (intermittently — see below)" |
+
+The verified path forward narrows to **one** concrete multi-day project: build Mesa with virgl renderer + `wayland-egl` platform for Tizen TV x86_64 glibc, replace `/usr/lib64/driver/libEGL.so.1.0` and `libGLESv2.so.2.0` with the Mesa builds. After that, the compositor has working GL → Flutter has working EGL → app should render.
+
+### Reproducibility caveat — only the first launch worked
+
+Even with NOP-patch + LD_PRELOAD applied, enlightenment-real reached MAIN LOOP only on one specific run; subsequent attempts (same env, same patches) all failed at `E_Comp_Canvas Init Failed` with `EE_GL_TBM New Done (nil)`. After a full QEMU reboot, the next attempt also fails the same way. Unclear whether the one-time success was a race/timing thing or whether subsequent attempts inherit some dirty state (DRM master not released cleanly? EGL display cached?). Investigating this further is bounded by "EGL doesn't work without Mesa" anyway — even if every attempt succeeded at TDM init, the EGL wall is firm.
+
+### Updated stop condition (this loop)
+
+The user's mandate explicitly rejects "multi-day project = stop". So this iteration documents but does not declare terminus. The next non-destructive thing a future session could do is:
+
+1. Cross-compile Mesa 23.x with `--enable-gallium-virgl` + Wayland EGL platform, targeting glibc 2.36 x86_64 (matches Tizen TV image).
+2. Push `libEGL.so.1.0`, `libGLESv2.so.2.0`, and any `dri/virtio_gpu_dri.so` to `/usr/lib64/driver/` (with `chsmack -a "*"`).
+3. Re-launch enlightenment with `LD_PRELOAD=drm_planes_shim.so` + the new EGL. Verify `MAIN LOOP AT LAST` and `/run/wayland-0` stay up.
+4. Install + launch hello_tizen_tv. Verify Flutter EGL surface gets a buffer, fb0 receives content.
+
+This is real engineering, ~1-2 days for someone with Mesa cross-compile experience and a Tizen TV rootfs sysroot. **The current loop continues to schedule itself** until that work is done OR until purely destructive options are all that remain.
+
+### New byte patch persisted in qcow2 (revertible)
+
+- `/hal/lib64/libtdm-emulator.so` (alias of `libhal-backend-tdm.so`) at file offset `0x136d2` → 6× NOP (was `0f 84 60 01 00 00` = `je 0x13838`). Qcow2 offset `0x4039d6d2`. Made the count_planes==0 check fall through. **Note:** the LD_PRELOAD shim makes this patch redundant; we kept it active because the e12-style "first attempt success" only reproduced with both. Revert it cleanly with `qemu-io -c "write -P 0x0f 0x4039d6d2 1" ...` (and per-byte for `84 60 01 00 00`).
+
 **Status snapshots saved at this commit:**
 - `docs/FINDINGS.md` (this file) — full forensic log of every probe across the loop
 - `docs/static-fb-test/wmreadypoke.c` — static lwipc poker that satisfies systemd boot

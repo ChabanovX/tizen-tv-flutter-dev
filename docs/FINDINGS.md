@@ -975,3 +975,45 @@ That's our static binary's printf output going to `/dev/kmsg` via `run_enlighten
 
 **Caveat:** the qcow2 is now in a *non-standard state*: `enlightenment` is replaced. To restore normal Tizen behavior, write back the original 2.8 MB enlightenment ELF (the bytes are preserved in `/tmp/enlightenment.bin` extracted earlier). The script `run_enlightenment.sh` is back to its original 65-byte launch line at offset `0x7a2f1541`.
 
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 13:34 Europe/Moscow
+
+### HD 1920×1080 pixel fill via static binary — kernel cmdline `video=Virtual-1:1920x1080-32@60` unlocks HD scanout
+
+**Status:** verified positive — best-of-stack result
+
+**Single-flag kernel cmdline fix:** changed `video=LVDS-1:1920x1080-32@60` → `video=Virtual-1:1920x1080-32@60` in `start-with-gfx.sh`. Reason: virtio_gpu's connector reports its name as `card0-Virtual-1`, not `LVDS-1`. The kernel's `video=` parser silently ignores cmdline overrides that don't name an existing connector, so `LVDS-1` was being dropped and fb0 stayed at the VGA-text fallback 720×400. With the right connector name, the kernel sets `Console: switching to colour frame buffer device 240x67` (240 chars × 8 px = 1920 px, 67.5 rows × 16 px ≈ 1080 px). fb0 is now 1920×1080×32bpp = 8 294 400 bytes.
+
+**Static binary at HD:** rebuilt the fb0 fill binary to use `xres_virtual`/`yres_virtual` and a static row buffer up to 4096 px wide. Output (in klog):
+```
+MAGENTA fb0 1920x1080@32bpp xv=1920 yv=1080
+MAGENTA wrote 8294400 bytes (1920x1080)
+```
+
+**Visual proof:** `screendump` PPM is now 1920×1080, six MiB in size. The first triplets are `ff 00 ff` (magenta RGB), confirming our pixels are at the top of the buffer. Pixel histogram: 0=4.7M (fbcon text black bg), 255=1.2M (magenta), 170=308K (fbcon gray text). Visually the cocoa window shows the kernel boot log scrolling in the top-left quadrant with the entire bottom-right quadrant **solid magenta** — that's our static binary's output that fbcon hasn't yet overwritten with later log lines. The right-edge magenta bars persist throughout. Saved at `/tmp/tizen-utm/fb0_HD.png`.
+
+**Summary of the working stack** (final, as of 2026-05-13 13:34):
+
+| layer | state |
+| --- | --- |
+| QEMU | `/tmp/qemu-head-src/qemu/build/qemu-system-x86_64-unsigned` (master, commit `5e61afe`) |
+| -machine | `pc -cpu Haswell-noTSX -smp 4 -m 1024 -accel tcg` |
+| -display | `cocoa -device virtio-vga` |
+| kernel | `~/tizen-kernel-build/output/bzImage.x86_64.gfx` with vigs stub kernel module |
+| kernel cmdline (key parts) | `video=Virtual-1:1920x1080-32@60 console=tty0 console=ttyS0 ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off host_ip=10.0.2.2 sdb_port=26100` |
+| qcow2 patches in `base_combined.qcow2` | deviced.powerdown_ap → `ret` (0x465909d0); libdrm_vigs.device_create version-check `je` → `jmp` (0xc97e266); libtdm-emulator.drmOpen("vigs") → `mov eax,-1` (0x4039dcab) |
+| Tizen boot reaches | every service up except `enlightenment`, which GPFs at libc+0x749aa due to QEMU 11 x86→arm64 TCG bug on Apple Silicon (deterministic, untouchable from outside QEMU) |
+| Render path | `/dev/fb0` writes from static x86_64 musl binary → virtio_gpu → cocoa, full HD 1920×1080×32bpp |
+| Not working | dynamic-libc code paths that enlightenment exercises; Flutter Tizen TV apps may hit the same TCG bug if they exercise that path |
+
+**Files:**
+- `/tmp/static-fb-test/fb0test.c` — 40 lines, static fb0-fill
+- `/tmp/static-fb-test/fb0test` — 179 KB static x86_64 binary (musl)
+- `/tmp/tizen-utm/fb0_HD.png` — 1920x1080 proof screenshot, magenta + fbcon text overlay
+- `/tmp/tizen-utm/start-with-gfx.sh` — launcher with `video=Virtual-1:...` cmdline
+
+**Cleanup:** original `/usr/bin/enlightenment` ELF restored in qcow2 at offset `0x64ea000`. `run_enlightenment.sh` is in its original 65-byte form. The kernel cmdline change to `video=Virtual-1:1920x1080-32@60` is left in place — it's a strict improvement (HD instead of VGA text mode) regardless of whether enlightenment runs.
+

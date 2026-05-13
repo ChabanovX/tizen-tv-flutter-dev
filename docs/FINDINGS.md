@@ -1330,3 +1330,58 @@ Despite the mystery, the cascade unblocked enough downstream that pkgcmd-class o
   - /usr/bin/enlightenment → wmreadypoke 150 KB static x86_64 musl (0x64ea000)
 - kernel cmdline: `video=Virtual-1:1920x1080-32@60` for HD fb0
 
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 15:46 Europe/Moscow
+
+### TPK install + AUL launch both succeeded — Flutter app starts but stuck in dotnet-loader respawn loop
+
+**Status:** install + launch verified positive; UI render stalled at next-layer wall
+
+**Push to resolved path:** instead of `/home/owner/share/tmp/sdk_tools/` (involves `/home → /opt/usr/home` symlink that pkgcmd's `realpath()` can't traverse in user-shell context), pushed to the canonical `/opt/usr/home/owner/share/tmp/sdk_tools/h.tpk`. **Push completed in 4.173 s at 11.2 MB/s** — *35× faster than the symlinked path* (was 152 s previously). Tracking down what makes the symlinked path so slow is a separate investigation; the canonical path is just faster.
+
+**pkgcmd install:**
+```
+$ sdb -s emulator-26101 shell "pkgcmd -i -t tpk -p /opt/usr/home/owner/share/tmp/sdk_tools/h.tpk"
+path is /opt/usr/home/owner/share/tmp/sdk_tools/h.tpk
+__return_cb pkgid[com.example.hello_tizen_tv] key[start] val[install]
+__return_cb pkgid[com.example.hello_tizen_tv] key[install_percent] val[10/20/30/40/50/60/70/80/90/100]
+__return_cb pkgid[com.example.hello_tizen_tv] key[end] val[ok]
+spend time for pkgcmd is [11323]ms
+```
+**Install succeeded** in 11.3 s. App lives at `/opt/usr/apps/com.example.hello_tizen_tv/`.
+
+**`pkgcmd -l` confirms:** `pkg_type [tpk] pkgid [com.example.hello_tizen_tv] name [hello_tizen_tv] version [1.0.0] storage [internal]`.
+
+**Manifest sanity check** (from inside the installed dir):
+```
+<ui-application appid="com.example.hello_tizen_tv" exec="Runner.dll" type="dotnet">
+```
+Flutter Tizen TV apps use the .NET (`dotnet`) embedder. Launch goes through `dotnet-launcher` → `dotnet-loader-inhouse` → loads `Runner.dll` → spawns Flutter engine via P/Invoke.
+
+**AUL launch:**
+```
+$ sdb shell "aul_test launch com.example.hello_tizen_tv"
+[aul_launch_app test] com.example.hello_tizen_tv
+... test successful ret = 4318
+```
+AUL accepted the launch and returned a PID. But no `Runner.dll` / `dotnet` process visible via `ps -ef`. Klog shows the dotnet-launcher in a **respawn loop**:
+```
+E/LAUNCHPAD: loader_context.cc: Dispose(220) > Dispose. type(1), name(dotnet-loader-inhouse), pid(0)
+E/DOTNET_LAUNCHER: plugin-dotnet-inhouse.cpp: GetTPAFromCache(121) > access TPA RW file errno: No such file or directory
+```
+
+Looped every ~2 s indefinitely; PID counter incremented from 14200+ → 14600+ in 30 s. The dotnet-loader can't find its **TPA cache file** (Trusted Platform Assemblies — .NET's compiled assembly cache).
+
+**Why TPA missing:** `dotnet-init.service` was in our 6-failed-services list. It's the unit responsible for first-boot setup that builds the TPA cache from the bundled .NET corelibs in `/usr/share/dotnet`. Without it running successfully, no app can launch dotnet.
+
+`dotnet-init.service` is in the "failed" list because earlier its ExecStart hit /proc/vd_signal_policy_list write errors. That's a non-critical write that should be ignorable.
+
+**Screenshot at this state:** 1920×1080 PPM with only 0 (black) and 0xaa (fbcon gray text) — no Flutter UI; the dotnet-loader never reaches the point where Flutter would create its graphics output.
+
+**Next wall:** if dotnet-init's setup chain can be coaxed to complete (likely patching dotnet-init.sh to skip vd_signal_policy_list-class failures), the TPA cache will be built and the next launch attempt would proceed deeper. Each layer reveals the next: lwipc events → SDB ready → SMACK fences → wm_ready timeouts → pkgcmd path resolution → install OK → AUL launch OK → dotnet-loader → TPA cache missing.
+
+**Stack additions this iteration:** no qcow2 patches; only methodology change (push to canonical path bypasses realpath issue).
+

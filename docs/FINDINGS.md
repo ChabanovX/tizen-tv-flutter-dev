@@ -1017,3 +1017,35 @@ MAGENTA wrote 8294400 bytes (1920x1080)
 
 **Cleanup:** original `/usr/bin/enlightenment` ELF restored in qcow2 at offset `0x64ea000`. `run_enlightenment.sh` is in its original 65-byte form. The kernel cmdline change to `video=Virtual-1:1920x1080-32@60` is left in place — it's a strict improvement (HD instead of VGA text mode) regardless of whether enlightenment runs.
 
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 13:39 Europe/Moscow
+
+### Flutter Tizen run test: blocked by SDB "unknown" state when enlightenment GPFs
+
+**Status:** verified negative — SDB auth requires enlightenment-class WM-state, which we don't have
+
+**Test:** booted the stack as documented in the HD section above (original `/usr/bin/enlightenment` restored, `video=Virtual-1:1920x1080-32@60`, all three working qcow2 patches), then polled `sdb devices` while watching klog.
+
+**Observed:**
+- enlightenment process exists (lwipc shows it at 8s) and crashes at 27s with the usual libc+0x749aa GPF
+- sdbd process spawns at ~118s wall time (much later than in the pre-HD-cmdline round, but it does come up)
+- `sdb devices` output:
+  ```
+  emulator-26101      unknown   Tizen_TV_HD1080
+  ```
+- `unknown` state means sdbd has reached the host's SDB server (port 26099) and the handshake started, but device-name negotiation hasn't completed.
+- `sdb -s emulator-26101 capability` returns `error: target not found`. `sdb shell ls /tmp` likewise. The protocol-level enrollment is incomplete.
+
+**Why this is happening (hypothesis, not verified):** Tizen's sdbd waits on `/run/.wm_ready` or `/tmp/wm_start` flags (created by enlightenment) for the secure-handshake step that promotes the connection from "unknown" to "device". With enlightenment dead at libc+0x749aa, those flags never appear. The earlier round where `sdb devices` showed `device` properly was before some kernel cmdline change (likely the `console=tty0` addition for fbcon-debug or the `video=Virtual-1` HD swap) — boot used to reach SDB-ready in ~70 s. Now sdbd takes ~118 s and never finishes auth.
+
+**Outcome on the user goal:** `flutter-tizen run -d emulator-26101 hello_tizen_tv` cannot proceed on this stack today because sdb-device-state never reaches `device`. Combined with the libc TCG wall, **Flutter Tizen TV apps cannot be deployed-and-rendered on Apple Silicon via this emulator** without one of:
+
+1. Fixing QEMU 11's x86→arm64 TCG mistranslation (multi-week QEMU upstream work).
+2. Running the emulator on an x86 Linux/Mac box where TCG-on-arm64 isn't the path.
+3. Building enlightenment statically against musl (theoretically yields the same workaround as our fb0test.c, but the Tizen-TV-specific enlightenment modules link a long chain of EFL libs that would need the same treatment — multi-day at minimum).
+
+**For local Flutter development today:** build/sign locally on Apple Silicon (this part works completely), then run/render on real Samsung TV hardware in Developer Mode. The emulator on this hardware is useful only for build-system validation and SDB-install-flow testing — neither of which require a working compositor.
+

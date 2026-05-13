@@ -1236,3 +1236,51 @@ appcmd_support:disabled            (NOT controlled by is_debug)
 - 1 binary replacement: wmreadypoke (150 KB static x86_64 musl) at `/usr/bin/enlightenment` (0x64ea000), fires 19 lwipc events at run_enlightenment.sh time so SDB completes auth
 - kernel cmdline: `video=Virtual-1:1920x1080-32@60` for HD fb0
 
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 15:05 Europe/Moscow
+
+### Manual `pkgcmd -i` hangs even with shell working — install daemon chain incomplete without real enlightenment
+
+**Status:** wall identified
+
+**Setup:** wmreadypoke at /usr/bin/enlightenment + is_debug patch in libsdbd_plugin → SDB device state with intershell/rootonoff enabled. sdb shell + sdb push both work. TPK successfully pushed to `/home/owner/share/tmp/sdk_tools/hello.tpk` (48 MB, ~6 minutes).
+
+**What works:**
+- `sdb shell pkgcmd -l 2>&1 | head` returns list of preinstalled apps (Ddrm, appbinarymanager, com.samsung.tv.AOTManagerDashboard, …)
+- `sdb shell ls /opt/usr/apps/` returns the app dirs
+- pkgmgr-info.service is running
+
+**What hangs:**
+- `sdb shell pkgcmd -i -t tpk -p /home/owner/share/tmp/sdk_tools/hello.tpk` prints `path is /opt/usr/home/owner/share/tmp/sdk_tools/hello.tpk` and then never returns. The install backend waits indefinitely.
+
+**Why** — boot reaches `systemctl list-units --type=service --state=running` showing 48 services up, BUT `--state=failed` shows:
+```
+bootmode-graphical.service       loaded failed
+buds-conn-manager.service        loaded failed
+ContentServiceManager.service    loaded failed
+dotnet-init.service              loaded failed
+emul-setup-audio-volume.service  loaded failed
+emuld.service                    loaded failed
+sp-service.service               loaded failed
+swu-verifier-tv.service          loaded failed
+system-default-target-done.service loaded failed
+vdca-update.service              loaded failed
+webauthn.service                 loaded failed
+wm_ready.service                 loaded failed (Result: timeout)
+```
+
+`wm_ready.service` does `while [ ! -e /tmp/.wm_ready ]; do sleep 0.1 ; done` with `TimeoutSec=30s`. Our wmreadypoke does `creat("/tmp/.wm_ready", 0644)` so the file exists — but `sdb shell ls /tmp/.wm_ready` returns `Permission denied`. So the root-context shell that wm_ready.service runs (looking up SMACK label "_") can't read the User-labeled file we created, and the service times out.
+
+The downstream effect: `tizen-boot.target` isn't satisfied, `system-default-target-done.service` failed, and the AUL/installer chain socket at `/run/aul/socket` is missing, so anything that goes through it (pkgcmd → pkg_install → install_backend) blocks at the socket call.
+
+**Why this is the wall on this path:** to actually install and launch apps, we'd need:
+
+1. `setxattr` SMACK label "_" or "System" on the lwipc-event-files we creat() — requires the binary to have CAP_SETFCAP + correct SMACK rules to allow re-labeling. Our static musl binary running as enlightenment.bin's User label can't do that.
+2. Or: bypass wm_ready.service by patching its unit file to skip the wait — but the unit file is on partition 1 (rootfs), so byte-patchable. Then it would still hit other downstream failures.
+3. Or: get enlightenment to run for real, which requires the QEMU 11 TCG bug fix that's unfixable from outside QEMU on Apple Silicon.
+
+**Current concrete usability:** the emulator boot-on-Apple-Silicon is now genuinely usable for SDB push, shell, pkgcmd list, ls-around-filesystem. Not for app install/launch/render. For Flutter Tizen dev, this means: a Tizen target shows up in `flutter-tizen devices`, build/sign/push work locally, but the actual `flutter-tizen run` step that calls install + AMD launch can't complete on this stack. Render-test must happen on real TV hardware.
+

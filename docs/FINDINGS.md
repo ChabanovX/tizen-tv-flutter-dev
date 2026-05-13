@@ -1512,6 +1512,25 @@ When `aul_test launch com.example.hello_tizen_tv` is run while no compositor is 
 
 The implication is that whenever enlightenment-real successfully reaches MAIN LOOP and stays up for the ~60-90 s window we observed, **Flutter should at least connect to the compositor**. Whether it then succeeds in `eglCreateWindowSurface` is the next test — and that test is what's blocked by the VIGS-only EGL.
 
+### Iteration 3 — 2026-05-13 — Flutter embedder loads and reaches inotify wait
+
+User re-fired `/loop` after the iteration 2 wakeup; further iteration produced concrete progress:
+
+**Repro recipe for compositor**: launching `enlightenment-real` with the LD_PRELOAD shim **immediately** after sdb authenticates (~120 s post-boot) reaches `MAIN LOOP AT LAST` in ~0.5 s and creates `/run/wayland-0` within 1 s. Confirmed by `Socket up at t=1s` in `/tmp/launch_seq.sh` output, with `MAIN LOOP AT LAST` at `ESTART: 0.48836`. Subsequent re-launches of the same binary on the same boot consistently fail at `E_Comp_Canvas Init Failed`. Bottom line: **first-after-boot launch reliably succeeds; re-launches reliably fail.** Likely cause is non-released DRM master / TBM cache from the prior attempt that the kernel virtio_gpu driver doesn't recover from on FD close — needs a fresh process tree.
+
+**Flutter Tizen embedder DOES load**. Once `aul_test launch com.example.hello_tizen_tv` fires with a live `/run/wayland-0`, `/proc/<pid>/maps` confirms:
+- `/opt/usr/apps/com.example.hello_tizen_tv/bin/Tizen.Flutter.Embedding.dll` — the C# Flutter embedding bindings
+- `/usr/lib64/ecore_wl2/engines/dmabuf/v-1.25/module.so` — the dmabuf wayland engine (note: NOT the gl_drm or gl_tbm engine)
+- The full Tizen runtime: app-core, app-core-ui, capi-appfw-application, etc.
+
+`/proc/<pid>/syscall` shows `wait_woken → inotify_read`, and the single inotify watch is on `/run` (inode 0x27d5 = 10197) with mask `0x102` (`IN_DELETE_SELF | IN_MOVE_SELF`). **Flutter Runner.dll is sleeping waiting for `/run/wayland-0` to come back** because enlightenment SIGSEGVed seconds after Flutter connected.
+
+**Why enlightenment dies on Flutter connect (open question):** Enlightenment crashes shortly after the Flutter app launches via AUL. The segfault is reported as the launcher script seeing `Segmentation fault env LD_PRELOAD=... /tmp/enlightenment-real`. Likely the compositor's handler for one of Flutter's Wayland protocol messages (`tizen_policy`, `tizen_surface_extension`, `tizen_cursor` — all Samsung-specific extensions enlightenment binds as globals) crashes on a malformed/expected request. Without enlightenment source (the binary is unstripped, but reverse-engineering the Tizen extensions is hours of work), we can't pinpoint which protocol message.
+
+**Practical implication:** Flutter's pipeline-up-to-EGL appears to work. The first-fault wall is now compositor stability under Tizen-extension protocol load, not EGL. If we can keep enlightenment alive long enough, the next thing we'd see is whether `eglCreateWindowSurface` succeeds. Given VIGS-only libEGL, expected failure mode is `EGL_NOT_INITIALIZED` or similar.
+
+**fb0 is dead-end**: `/dev/fb0` raw dump shows the SeaBIOS boot screen frozen — i.e., **fb0 is never written to** in this stack. virtio_gpu uses DRM (KMS scanout) and the cocoa display reads from the DRM front buffer, not fbdev. Capturing the live render means capturing the cocoa window (`screencapture` failed without explicit Screen Recording permission — left as TBD).
+
 ### Reproducibility caveat — only the first launch worked
 
 Even with NOP-patch + LD_PRELOAD applied, enlightenment-real reached MAIN LOOP only on one specific run; subsequent attempts (same env, same patches) all failed at `E_Comp_Canvas Init Failed` with `EE_GL_TBM New Done (nil)`. After a full QEMU reboot, the next attempt also fails the same way. Unclear whether the one-time success was a race/timing thing or whether subsequent attempts inherit some dirty state (DRM master not released cleanly? EGL display cached?). Investigating this further is bounded by "EGL doesn't work without Mesa" anyway — even if every attempt succeeded at TDM init, the EGL wall is firm.

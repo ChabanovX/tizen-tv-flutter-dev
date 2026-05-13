@@ -1172,3 +1172,36 @@ The boot is slow (~150s before SDB auth, vs ~100s when enlightenment runs normal
 
 **What this unblocks:** the full `flutter-tizen run` pipeline is now usable on Apple Silicon for build/install/AMD-launch flow. UI rendering (Flutter widget tree visible on cocoa) is the next test; the libc TCG bug at libc+0x749aa is enlightenment-only — the dart_runner / Flutter engine path may or may not exercise the same mistranslated code.
 
+
+---
+
+MODEL_NAME = Claude Opus 4.7
+FINDING_DATE = 2026-05-13 14:39 Europe/Moscow
+
+### sdb install / appcmd blocked by Tizen TV release-mode capability flags; libsdbd_plugin.so byte-patch unlocks intershell
+
+**Status:** discovery + applied patch; verification pending boot
+
+**Observation:** Once SDB is at `device` state, the `sdb capability` output shows:
+```
+intershell_support:disabled
+appcmd_support:disabled
+rootonoff_support:disabled
+secure_protocol:enabled
+filesync_support:pushpull
+```
+
+So:
+- `sdb push <file>` works (we've verified it; pushed a 48 MB TPK to `/home/owner/share/tmp/sdk_tools/` in ~152 s, though sometimes the connection drops mid-transfer)
+- `sdb shell` returns immediately as "target not found" because `intershell_support:disabled`
+- `sdb install <tpk>` pushes the file but then fails ("Process is not ready, exited") because the install daemon path needs `appcmd_support`
+- `flutter-tizen run` ends with "Installing TPK failed: ... fatal: failed to write" — same root cause
+
+**Where these flags come from:** Tizen's sdbd has a Samsung plugin `libsdbd_plugin.so` (101 KB, at `/usr/lib64/`) that exports `get_plugin_capability`, `_getIntershell`, `_get_extra_capability`, etc. The capability strings are returned to host based on internal checks (`is_debug()` typically returns false because Tizen TV in release mode requires `develop_mode` file at `/home/owner/apps_rw/com.samsung.tv.store/data/develop_mode`, which doesn't exist on our qcow2 — that path is on partition 2, would require complex ext4 mods to create).
+
+**Surgical byte patch:** `_getIntershell` at plugin offset `0x83b0` was originally `31 c0 e9 19 f8 ff ff` (xor eax,eax; jmp is_debug — 7 bytes). Patched to `b8 01 00 00 00 c3 90` (mov eax, 1; ret; nop) — always returns 1.
+
+qcow2 absolute offset: `0x1b74b3b0` (= partition-relative byte from inode 1274's extent (4096 × 112195) + 0x83b0 + MBR 0x100000). One-shot via `qemu-io --cmd 'write -s /tmp/intershell_patch.bin 0x1b74b3b0 7'`.
+
+(The plugin's other `_get*` capability functions follow the same pattern — likely a similar one-byte/one-instruction patch for `_getAppcmd`, `_getRootOnOff` etc. if they exist. Verify after boot.)
+

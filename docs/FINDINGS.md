@@ -1506,6 +1506,12 @@ There is no Mesa DRI directory (`/usr/lib64/dri/` doesn't exist), and the driver
 
 The verified path forward narrows to **one** concrete multi-day project: build Mesa with virgl renderer + `wayland-egl` platform for Tizen TV x86_64 glibc, replace `/usr/lib64/driver/libEGL.so.1.0` and `libGLESv2.so.2.0` with the Mesa builds. After that, the compositor has working GL → Flutter has working EGL → app should render.
 
+### One additional finding — Flutter wants `/run/user/5001/wayland-0`
+
+When `aul_test launch com.example.hello_tizen_tv` is run while no compositor is up, the dotnet-launcher reaches `RunEngine`, libwayland-client logs `connect() failed: fd(83) errno(2, No such file or directory) socket path(/run/user/5001/wayland-0)`, and the app exits. **Important:** `/run/user/5001/wayland-0` is already a symlink to `/run/wayland-0` on this image. So `XDG_RUNTIME_DIR=/run` (what we use for enlightenment) is fine for compositor placement; Flutter resolves via the symlink. We do not need to launch enlightenment with `XDG_RUNTIME_DIR=/run/user/5001`.
+
+The implication is that whenever enlightenment-real successfully reaches MAIN LOOP and stays up for the ~60-90 s window we observed, **Flutter should at least connect to the compositor**. Whether it then succeeds in `eglCreateWindowSurface` is the next test — and that test is what's blocked by the VIGS-only EGL.
+
 ### Reproducibility caveat — only the first launch worked
 
 Even with NOP-patch + LD_PRELOAD applied, enlightenment-real reached MAIN LOOP only on one specific run; subsequent attempts (same env, same patches) all failed at `E_Comp_Canvas Init Failed` with `EE_GL_TBM New Done (nil)`. After a full QEMU reboot, the next attempt also fails the same way. Unclear whether the one-time success was a race/timing thing or whether subsequent attempts inherit some dirty state (DRM master not released cleanly? EGL display cached?). Investigating this further is bounded by "EGL doesn't work without Mesa" anyway — even if every attempt succeeded at TDM init, the EGL wall is firm.

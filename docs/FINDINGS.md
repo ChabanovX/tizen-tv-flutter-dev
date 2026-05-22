@@ -1786,3 +1786,28 @@ WRT_USE_ONSCREEN_RENDERING=1
 ```
 
 The intent is that `EVAS_RENDER_ENGINE=wayland_shm` will make ecore_evas wayland engine pick the `wayland_shm` module instead of `wayland_egl`, `ELM_ACCEL=none` will stop Elementary from requesting GL accel, and `WRT_USE_ONSCREEN_RENDERING=1` may help wrt-loader (home-screen runtime) use sw composition.
+
+### Task 3 result — boot observation with shm env vars
+
+**Significant progress vs iter7 baseline.**
+
+| metric | iter7 baseline | iter8 task3 |
+|---|---|---|
+| sdb sees device | yes | **yes** |
+| enlightenment running | no (only patched-binary attempts failed) | **YES (PID 1866)** |
+| `/tmp/.wm_ready` lwipc event | not fired | **DONE** |
+| `/run/.wm_ready` lwipc event | not fired | **DONE** |
+| `/tmp/einfo_ready` lwipc event | not fired | **DONE** |
+| SMACK denials on `.wm_ready` over 30s | 32 | 62 (boot proceeded further, more re-reads) |
+| eglGetDisplay fails total | persistent | 118 (other apps) |
+| Skin canvas (Tizen Emulator window) | black | still black |
+
+**Key wins:**
+- enlightenment compositor **does** start with shm env vars and successfully fires the lwipc events that release systemd's WM-ready dependency. The Mac iter4 6-byte HWC patch is not required on Linux when shm engine is selected.
+- WM-ready unblock is real progress: systemd boot now proceeds past the WM gate.
+
+**What's still broken:**
+1. The Tizen Emulator host window's inner skin canvas remains black. This is **independent** of guest rendering — it's the host-side `maru_qt5` display backend running in "QT5 Offscreen" mode (set by `-display maru_qt,rendering=offscreen` which the emulator binary hardcodes). Our iter7 patch of `qt5_early_prepare` to force `qt5IsOnscreen=1` was not sufficient — the real onscreen toggle is inside `qt5_gui_init` which uses Qt vtable indirection.
+2. Apps other than enlightenment (specifically wrt-loader / Chrome web runtime instances) still call `eglGetDisplay()` and fail. Likely those processes are spawned before `/etc/profile.d/*` is sourced — they probably get env from systemd unit definitions that don't include our drop-in. Need to investigate whether profile.d applies to processes spawned by `aul-launchpad-starter` (the Tizen app launcher).
+
+**Decision**: continue to Task 4 — try `flutter-tizen run --enable-software-rendering`. Even though skin canvas is black, Flutter may surface in sdb logs differently. The Approach A hypothesis was about UI appearing — if Flutter's libflutter_tizen.so also calls eglGetDisplay (as captured in iter6), then Approach A blocks here for Flutter too and we must escalate to **Task 6** (libflutter_tizen.so binary patch) or **Approach B** (deeper emulator RE to force host onscreen).

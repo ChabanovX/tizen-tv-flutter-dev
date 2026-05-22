@@ -1978,3 +1978,60 @@ Three paths:
 **B. Boot a different X11-native session** (depends on whether Pop!_OS allows): GDM/lightdm login type switching. If user can choose X11 instead of Cosmic Wayland at login, might be 5-minute test.
 
 **C. Accept and stop**: document state, ship headless pipeline as the deliverable. UI development on Linux requires Pop!_OS swap or different VM.
+
+---
+
+## Iteration 10b — Xephyr nested X server test (host-env fix attempt)
+
+Setup: installed `xserver-xephyr`. Launched `Xephyr :2 -screen 1920x1080`. Launched emulator with `DISPLAY=:2` (full native X11, not XWayland). Re-applied qcow2 shm env vars (lost when snapshot-restored from golden).
+
+Boot result: emulator alive, sdb device, enlightenment runs cleanly with all lwipc events fired (.wm_ready, wm_start, einfo_ready).
+
+Screenshot of Xephyr root (`DISPLAY=:2 import -window root`): **still solid black inner canvas**. Outer emulator window placement visible as a black rectangle in upper-left of the 1920x1080 Xephyr screen.
+
+### What this rules out
+
+Running inside Xephyr (a fresh, isolated, native X11 server) gives the **same black canvas** as Cosmic XWayland. This conclusively rules out the host display environment as the cause:
+
+- ❌ Not Cosmic Wayland specific
+- ❌ Not XWayland-vs-native-X11 specific
+- ❌ Not Qt5.6 + Wayland specific
+
+The wall is in the **emulator's VIGS pixel pipeline itself**, independent of which X server we run under.
+
+### Architectural picture
+
+Full chain needed to display guest pixels:
+1. Guest EFL apps render with `wayland_shm` (software) → enlightenment Wayland compositor
+2. Enlightenment composites → writes to guest's DRM device (vigs DRM driver in guest kernel 4.4.35)
+3. VIGS QEMU plugin host-side receives the DRM buffer
+4. maru_qt5 display backend pulls the buffer and paints onto MainWindow canvas widget
+
+Our iter8 patches fixed step 1. Iter9 patches forced steps 3/4's flag state. But neither solves the actual wiring of the buffer flow between steps. Logs confirm:
+- `vigs_offscreen_server_create` line **removed** by our patches in iter9 (was present in iter6 baseline)
+- No `vigs_onscreen_server_create` line **either** — VIGS did not create the alternative server
+- Result: VIGS device is initialized but has neither offscreen nor onscreen server → no pixel pipeline path
+
+So the emulator binary on this Tizen Studio 6.1 + Pop!_OS noble combination simply **doesn't wire** the VIGS-to-MainWindow pixel pump in either offscreen OR onscreen mode. The original offscreen path that prior iterations triggered may have been "render to memory but never connect to display anyway". Hence both TV and mobile emulators are non-displayable on this stack.
+
+### Final conclusion
+
+This is a genuinely closed architectural wall for the Samsung emulator binary version 2.8.0.38 (Dec 2025 build) running on Pop!_OS 24.04 noble. To get visible UI requires:
+
+- **Different Linux base** where this Samsung binary was actually QA'd (likely Ubuntu 22.04 jammy or older). Probably also needs Tizen Studio 5.x with the LLVM-10 toolchain that we worked around.
+- **OR dynamic analysis** (gdb on running emulator, breakpoints on display backend init, ltrace) to find the missing wiring step — weeks of work with uncertain outcome.
+- **OR real Samsung TV in dev mode** — bypasses emulator entirely.
+
+The headless dev pipeline (build + sign + install + AUL launch + Dart VM Service) is preserved and works. UI development is blocked.
+
+### Artifacts at end of session
+
+- `~/tizen-studio/platforms/tizen-10.0/tv-samsung/emulator/bin/emulator-x86_64` — patched (3 binary patches), original at `.orig`
+- `~/tizen-studio-data/emulator/vms/hello_tv/emulimg-hello_tv.x86_64.golden` — clean snapshot
+- `~/tizen-studio-data/emulator/vms/hello_tv/emulimg-hello_tv.x86_64` — working overlay with shm env vars in `/etc/profile.d/zz-evas-shm.sh` and `/etc/systemd/system.conf.d/evas-shm.conf`
+- `~/SamsungCertificate/hello-tizen-tv/` — Samsung-issued certs (password `TizenAuthorPass1!`)
+- `~/development/flutter-tizen/flutter/bin/cache/artifacts/engine/tizen-x64/8.0/libflutter_tizen_tv.so` — patched at 0x49703
+- `~/development/flutter-tizen/lib/tizen_sdk.dart` — patched (`defaultNativeCompiler='gcc'`)
+- `/tmp/run_tv_no_tuner.sh` and `/tmp/run_tv_xephyr.sh` — launcher scripts
+- `/tmp/hello_tv_no_tuner.conf` — vm_launch.conf without WSI-dependent devices
+- This entire iteration history in `docs/FINDINGS.md` (iter1-10b)

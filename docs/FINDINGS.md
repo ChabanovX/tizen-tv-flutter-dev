@@ -1811,3 +1811,49 @@ The intent is that `EVAS_RENDER_ENGINE=wayland_shm` will make ecore_evas wayland
 2. Apps other than enlightenment (specifically wrt-loader / Chrome web runtime instances) still call `eglGetDisplay()` and fail. Likely those processes are spawned before `/etc/profile.d/*` is sourced — they probably get env from systemd unit definitions that don't include our drop-in. Need to investigate whether profile.d applies to processes spawned by `aul-launchpad-starter` (the Tizen app launcher).
 
 **Decision**: continue to Task 4 — try `flutter-tizen run --enable-software-rendering`. Even though skin canvas is black, Flutter may surface in sdb logs differently. The Approach A hypothesis was about UI appearing — if Flutter's libflutter_tizen.so also calls eglGetDisplay (as captured in iter6), then Approach A blocks here for Flutter too and we must escalate to **Task 6** (libflutter_tizen.so binary patch) or **Approach B** (deeper emulator RE to force host onscreen).
+
+### Task 6 result — patched libflutter_tizen.so, Dart VM running but no surface
+
+Patched file: `/home/vld/development/flutter-tizen/flutter/bin/cache/artifacts/engine/tizen-x64/8.0/libflutter_tizen_tv.so` at offset `0x49703`.
+
+Original 6 bytes: `0f 84 c2 00 00 00` (`je 0x497cb` — jump-if-zero to "display was not valid" error block).
+Patched to: `90 90 90 90 90 90` (6× NOP — skip the check unconditionally).
+
+After patch + rebuild + reinstall:
+- TPK install + AUL launch succeed (PID 5690)
+- Flutter engine no longer aborts at `RunEngine line 117` with "display was not valid"
+- **Dart VM Service launches**: `http://127.0.0.1:46641/F299WYdKWaY=/`
+- `flutter-tizen run` displays "Hot reload" key bindings — meaning the tool connected to the Dart VM
+
+**But Flutter still tries to create an EGL surface and fails downstream:**
+```
+tizen_renderer_egl.cc PrintEGLError(339) > Unknown EGL error: 0
+tizen_renderer_egl.cc CreateSurface(62) > Could not get EGL display.
+embedder_surface_gl_skia.cc(121) > Could not create a resource context for async texture uploads. Expect degraded performance.
+gpu_surface_gl_skia.cc(46) > Could not make the context current to set up the Gr context.
+gpu_surface_gl_skia.cc(83) > Could not make the context current to set up the Gr context.
+platform_view.cc(76) > Failed to create platform view rendering surface
+```
+
+App runs ~220 seconds (Dart code executes) but with no rendering surface. Eventually:
+```
+AMD app_status_manager: com.example.hello_tizen_tv is STATUS_DYING
+LAUNCHPAD: pid=5690, status=0 (clean exit after fg_launch_timeout)
+flutter-tizen tool: Lost connection to device. The Dart compiler exited unexpectedly.
+```
+
+`--enable-software-rendering` flag on `flutter-tizen run` did not stop the embedder from attempting GL setup. The Flutter engine fallback (when no surface is available) is degraded performance mode, not software-only Skia rasterization.
+
+**Independent host-side wall**: even when guest rendered the Tizen home screen earlier (Task 3 evidence: enlightenment lwipc D events for `/tmp/.wm_ready`, `/run/.wm_ready`), the host emulator window's skin canvas remained black. This is the `maru_qt5` "QT5 Offscreen" mode in `emulator-x86_64` — pixels rendered inside guest VIGS don't make it to the Qt5-painted skin canvas window.
+
+### Decision gate
+
+We're at the natural end of Approach A's reach. Two independent walls remain:
+
+**A6+: deeper patches in libflutter_tizen.so** — find the EGL surface creation call, patch the failure handler to use software path; or patch each subsequent abort point until Flutter survives with software rasterizer.
+
+**B: host-side maru_qt5 onscreen** — binary RE `qt5_gui_init` / `qt5_prepare` chain in `emulator-x86_64` to force host-side onscreen rendering. Without this, even a successfully-rendering guest produces invisible output.
+
+These are independent. Either alone is not sufficient: need both to see Flutter UI.
+
+Recommendation to user: **commit to Approach B now**. If host display works first (enlightenment-rendered Tizen home screen visible), we get visual feedback even while Flutter rendering issues remain. If we keep grinding A6+ without seeing anything visually, we're patching blind.

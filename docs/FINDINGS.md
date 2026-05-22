@@ -1603,3 +1603,143 @@ This is real engineering, ~1-2 days for someone with Mesa cross-compile experien
 - `/tmp/tizen-patched/base_combined.qcow2` — patched qcow2 (6 modifications listed elsewhere in this doc)
 
 Future sessions resuming this work should start from the "Loop terminus" header above and pick exactly one of the multi-day projects in the table.
+
+---
+
+## Iteration 6 (2026-05-22, Linux Pop!_OS migration)
+
+### Setup wins on Linux x86_64
+
+- SSH/Tailscale bridge: Mac + Linux on different L3 networks, Tailscale solved it (`100.x.x.x` CGNAT). Hiddify on Mac was hijacking the CGNAT range — adding `100.64.0.0/10` to its bypass list fixed routing.
+- Pop!_OS 24.04 Cosmic Wayland — works fine for Tizen Studio CLI; JavaFX HW Support tab in Emulator Manager does not render content area (sidebar only) — bug between JavaFX 8 and XWayland/Cosmic.
+- Screenshots: `cosmic-screenshot --interactive=false -s <dir>` works full desktop; X11-only tools (`scrot`, `import -window root`) capture only XWayland surfaces (black for compositor-owned content).
+
+### Required patches on Linux
+
+1. **flutter-tizen `defaultNativeCompiler`** in `~/development/flutter-tizen/lib/tizen_sdk.dart` line 207: `llvm-10.0` → `gcc`. Tizen Studio 6.1 ships only GCC (NativeToolchain-Gcc-14.2); `llvm-10.0` doesnt exist any more. Without this, build fails with . Also delete after patch to force recompile.
+
+---
+
+## Iteration 6 (2026-05-22, Linux Pop!_OS migration)
+
+### Setup wins on Linux x86_64
+
+- SSH/Tailscale bridge: Mac + Linux on different L3 networks, Tailscale solved it (100.x.x.x CGNAT). Hiddify on Mac was hijacking the CGNAT range — adding 100.64.0.0/10 to its bypass list fixed routing.
+- Pop!_OS 24.04 Cosmic Wayland works fine for Tizen Studio CLI; JavaFX HW Support tab in Emulator Manager does not render content area (sidebar only) — bug between JavaFX 8 and XWayland/Cosmic.
+- Screenshots: `cosmic-screenshot --interactive=false -s <dir>` works full desktop; X11-only tools (scrot, import -window root) capture only XWayland surfaces (black for compositor-owned content).
+
+### Required patches on Linux
+
+1. **flutter-tizen `defaultNativeCompiler`** in `~/development/flutter-tizen/lib/tizen_sdk.dart` line 207: change `llvm-10.0` to `gcc`. Tizen Studio 6.1 ships only GCC (NativeToolchain-Gcc-14.2); `llvm-10.0` doesn't exist any more. Without this, build fails with "Can not get the toolchain id". Also delete `~/development/flutter-tizen/bin/cache/flutter-tizen.snapshot` after patch to force recompile.
+
+2. **emulator.sh** — prepend `export QT_QPA_PLATFORM=xcb` near LD_LIBRARY_PATH. Without this, Qt 5.6 inside Samsung emulator looks for "wayland;xcb" plugin and aborts because no wayland plugin bundled. Cosmic Wayland sets WAYLAND_DISPLAY which triggers Qt's auto-detection.
+
+3. **libcurl3-gnutls** — Tizen Studio package manager refuses to proceed because this package no longer exists in noble. Workaround: build dummy package via `equivs` (also do `apt purge libcurl3-gnutls` between runs if dpkg leaves it half-configured).
+
+4. **deadsnakes PPA** for `python3.8` / `libpython3.8` — also gone from noble.
+
+5. **vm_launch.conf**: comment out `-device maru-virtual-tuner,...wsi=vigs_wsi` and `-device maru-external-input-pci,...wsi=vigs_wsi`. Both fail with "winsys interface 'vigs_wsi' not found" because no WSI plugin is registered when emulator runs in QT5 Offscreen mode (Display Type set by parsing `-display maru_qt,rendering=offscreen`). Without these two devices, the rest of the emulator boots successfully; Mobile (profile=tizen) emulator never had them and works fine.
+
+6. **`-device vigs,backend=sw` → `backend=gl`**: makes VIGS use the host's real OpenGL (vigs_gl_backend_glx_check_gl_version: Using OpenGL 3.1+ core, GL_VENDOR NVIDIA Corporation, GL_RENDERER NVIDIA GeForce RTX 3050). Required for any chance of pixel output later. No regression with backend=sw.
+
+### Samsung-issued cert reuse
+
+The Samsung-issued certs from prior Mac iteration (`~/SamsungCertificate/hello-tizen-tv/{author.p12, distributor.p12}`, password `TizenAuthorPass1!`) work on Linux unchanged. Created `tizen security-profiles add -n vld -a author.p12 -p ... -d distributor.p12 -dp ...` and set `tizen cli-config "default.profile=vld"`. `flutter-tizen run -d emulator-26101` then proceeds past the certificate verification step — pkgcmd reports `install start → installing[10] → installing[20]`, no longer "install failed[118, -12] reason: Check certificate error".
+
+### Where we are still stuck
+
+`flutter-tizen run` installs the TPK, AUL launches the app (PID assigned), but Flutter UI is black. Guest kernel log shows `evas-wayland_egl: eng_window_new() eglGetDisplay() fail. code=0` — the Tizen system layer that supplies the EGL surface for Flutter to draw into can't get an EGL display. This is the **same** wall described in the older sections: guest `/usr/lib64/driver/libEGL.so.1.0` is Samsung VIGS-only and eglGetDisplay() doesn't resolve to a working display.
+
+Additional independent wall: emulator's Qt5 backend runs in **Offscreen** mode by default ("Display Type: QT5 Offscreen" very early in emulator.log), so even if the guest produced pixels via VIGS, they would not be drawn onto the skin canvas. The "Tizen Emulator" window shows only the Samsung skin frame with a black inner TV screen.
+
+### Why Mesa-virgl pivot is harder than estimated
+
+Guest kernel is **Linux 4.4.35** (built Dec 2025 by Samsung). virtio-gpu virgl 3D protocol support requires kernel >= 4.9. So pivoting to stock-QEMU + virtio-gpu-gl-pci needs a fresh kernel inside the qcow2 — Samsung's kernel sources are open but their build needs Samsung tooling, adding a full kernel build week before Mesa even starts. Mount of base qcow2 also confirms: no `/usr/lib64/dri/`, no Mesa drivers at all, no `virtio_gpu` module — guest is **fully VIGS-stack**, no Mesa replacement is a drop-in.
+
+### Binary RE: vigs_qt5_onscreen_enabled at VA 0x389680
+
+Function checks qt5App (Qt application pointer) and reads byte qt5IsOnscreen (global flag). Returns true only if `qt5App != NULL && qt5IsOnscreen != 0`. Three callers: vigs_device_init, vigs_gl_backend_display, vigs_gl_backend_composite.
+
+qt5IsOnscreen is written in qt5_early_prepare at 0x48bdef via `mov byte [rbx], dil` — the first argument (a bool) is just copied to the flag. Caller is maru_early_qt5_display_init at 0x48b9cb which calls qt5_early_prepare(onscreen_arg). The onscreen_arg comes from the QEMU `-display maru_qt,rendering={onscreen,offscreen}` parser (strings at 0x7ad97e for "onscreen", 0x7ad987 for "offscreen").
+
+### Patches attempted
+
+**Attempt 1**: vigs_qt5_onscreen_enabled always returns 1 (`b8 01 00 00 00 c3` at 0x389680). Result: emulator **crashes** at startup. Reason: VIGS internal expects onscreen but maru_qt5_display is in offscreen — qt5App is NULL because Qt was not initialized for onscreen rendering. Reverted.
+
+**Attempt 2**: qt5_early_prepare writes qt5IsOnscreen = 1 unconditionally (`c6 03 01` at 0x48bdef, replacing `40 88 3b mov byte [rbx], dil`). Result: emulator **stays alive**, sdb devices shows emulator-26101 device hello_tv. But "Display Type: QT5 Offscreen" is still logged early — that line is set by a **different** sub-system (maru_qt5_display parsing the rendering=offscreen string from -display args), independent of qt5IsOnscreen. Skin canvas still shows black inside the TV frame.
+
+This narrows the next target: the maru_qt5_display flag parser around the `,rendering=` / `offscreen` / `onscreen` strings (0x7ad973, 0x7ad97e, 0x7ad987). Need xrefs to find that parser code and force its decision to onscreen even when arg is "offscreen".
+
+---
+
+## Iteration 7 (2026-05-22, Linux binary RE + enlightenment swap attempt)
+
+### Binary RE patch applied
+
+`emulator-x86_64` at file offset `0x48bdef` (in `qt5_early_prepare`):
+- Original: `40 88 3b` (`mov byte [rbx], dil` — writes the function arg to qt5IsOnscreen)
+- Patched:  `c6 03 01` (`mov byte [rbx], 1` — always writes 1)
+
+Effect: forces `qt5IsOnscreen=1` regardless of `-display maru_qt,rendering=offscreen` parser. Emulator no longer crashes (Attempt 1 crashed because of the inverse mismatch). `sdb devices` sees `emulator-26101 device hello_tv`. But **"Display Type: QT5 Offscreen"** is still logged — that line comes from the `maru_early_qt5_display_init` parser based on the raw input arg, separate from `qt5IsOnscreen`. The actual onscreen-mode decision lives in `qt5_gui_init` (called via `qt5_prepare`) and uses indirect Qt vtable calls — much harder to patch directly without deeper RE.
+
+### Enlightenment swap attempt — confirmed dead end
+
+Mounted `~/tizen-studio-data/emulator/vms/hello_tv/emulimg-hello_tv.x86_64` (overlay qcow2) via qemu-nbd (libguestfs crashed appliance on this host — switched to direct nbd which worked). Replaced `/usr/bin/enlightenment` with `enlightenment-patched` from `docs/static-fb-test/` (the Mac iteration-4 6-byte HWC patch that reached `MAIN LOOP AT LAST` on Mac).
+
+Boot result: identical to original. Guest kernel log:
+```
+E/EFL evas-wayland_egl: eng_window_new() eglGetDisplay() fail. code=0
+E/EFL ecore_evas: Failed to set Evas Engine Info for 'wayland_egl'
+audit: SMACK denied subject=User object=System requested=r name=".wm_ready"  ; x32 in 30s
+```
+
+Why it doesn't help: the patched enlightenment from Mac iter-4 needed `EE_SOFTWARE_TBM` to succeed before reaching MAIN LOOP. That precondition is **downstream** of `eglGetDisplay()` working. On Linux/NVIDIA host we have working host-side VIGS GL (NVIDIA OpenGL 3.2), but the guest-side libEGL.so.1.0 in qcow2 still can't `eglGetDisplay()` — that's the part that talks to the virtual GPU device. Enlightenment patched or not, it can't compose without EGL.
+
+The `.wm_ready` SMACK denial is the **symptom**, not the cause — without working compositor, the file is never created and systemd's WM-ready target never reaches active, so subsequent boot stages (home screen, TV launcher) never start.
+
+Reverted the enlightenment swap (`cp /tmp/enlightenment.orig /tmp/tizen-rw/usr/bin/enlightenment`) so the qcow2 is back to pristine state for any future attempts.
+
+### Architectural limit confirmed
+
+To get Flutter UI rendered visibly inside the Samsung TV emulator on **any** host requires the guest stack to have a working EGL implementation that connects to the virtual GPU. The current TV-10.0 guest:
+- Has only `libEGL.so.1.0` in `/usr/lib64/driver/` — Samsung VIGS-protocol only
+- No `/usr/lib64/dri/` (no Mesa DRI drivers)
+- No `virtio_gpu` kernel module (built monolithic kernel 4.4.35, predates virgl 3D protocol support which arrived in Linux 4.9)
+- maru-x86-machine QEMU machine type does not support `virtio-gpu-pci` device — vigs is hardwired
+
+Real fix requires *all* of:
+1. Build new kernel ≥4.9 (Samsung kernel sources are open but need Samsung dibs builder tooling)
+2. Cross-compile Mesa with virgl driver + Wayland EGL platform for Tizen TV x86_64 glibc ABI
+3. Replace `libEGL.so.1.0` + dependencies inside qcow2 with Mesa build
+4. Either patch maru-x86-machine to accept virtio-gpu, or pivot to stock QEMU and lose Samsung-specific devices (sdb registration relies on maru-evdi which only exists in maru-x86)
+
+Estimate: 1–2 weeks of focused work, with non-trivial risk of stalls (Samsung sysroot completeness, ABI mismatches between Mesa and Tizen glibc patches, lost Samsung-emulator-only features).
+
+### What's actually shippable now
+
+Working headless pipeline on this Linux box:
+- `flutter-tizen build tpk --target-arch x64 --device-profile tv` produces signed TPK
+- `flutter-tizen run -d emulator-26101` installs and AUL-launches the app (PID assigned, no certificate error)
+- `flutter test` for unit + widget tests on the host directly
+
+Not working: visible Flutter UI on emulator. To see UI today, use **real Samsung TV in dev-mode** — install the same signed TPK via `sdb push + pkgcmd install` on hardware. Everything the pipeline produces is hardware-compatible.
+
+### Files transferred to this Linux box
+
+- `~/SamsungCertificate/hello-tizen-tv/` — Samsung-issued author + distributor p12 (password `TizenAuthorPass1!`)
+- `~/development/hello_tizen_tv/` — project (without `docs/static-fb-test/qemu-vigs` and large binary artifacts)
+- `~/development/flutter-tizen/` — patched (`defaultNativeCompiler='gcc'`)
+- `~/tizen-studio/platforms/tizen-10.0/tv-samsung/emulator/bin/emulator-x86_64` — patched (`qt5IsOnscreen=1` force at 0x48bdef)
+- `~/tizen-studio-data/emulator/vms/hello_tv/` — VM created with `em-cli create -n hello_tv -p tv-samsung-10.0-x86_64`
+- `/tmp/run_tv_no_tuner.sh` — launcher script with vigs backend=gl, no tuner, no external-input
+- `/tmp/hello_tv_no_tuner.conf` — vm_launch.conf variant without WSI-dependent devices
+
+---
+
+## Iteration 8 (2026-05-22, Linux Approach A — EFL software backend)
+
+Spec: `docs/superpowers/specs/2026-05-22-tizen-emulator-ui-linux-design.md`.
+Plan: `docs/superpowers/plans/2026-05-22-approach-a-efl-shm-backend.md`.
+
+Hypothesis: forcing `EVAS_RENDER_ENGINE=wayland_shm` system-wide lets EFL apps render without `eglGetDisplay()`, which unblocks enlightenment → `.wm_ready` → boot completion → TV home screen rendering. Flutter embedder then runs with `--enable-software-rendering` and writes Skia frames to a Wayland shm buffer.
+

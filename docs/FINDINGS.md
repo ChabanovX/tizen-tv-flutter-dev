@@ -1857,3 +1857,71 @@ We're at the natural end of Approach A's reach. Two independent walls remain:
 These are independent. Either alone is not sufficient: need both to see Flutter UI.
 
 Recommendation to user: **commit to Approach B now**. If host display works first (enlightenment-rendered Tizen home screen visible), we get visual feedback even while Flutter rendering issues remain. If we keep grinding A6+ without seeing anything visually, we're patching blind.
+
+---
+
+## Iteration 9 (2026-05-22, Linux Approach B — host maru_qt5 onscreen RE)
+
+Spec: `docs/superpowers/specs/2026-05-22-tizen-emulator-ui-linux-design.md`.
+Continuing the work after iter8 (Approach A) hit the guest-Flutter EGL wall.
+
+### Binary patches applied to `emulator-x86_64`
+
+| VA | Original bytes | New bytes | Purpose |
+|---|---|---|---|
+| `0x48bdef` | `40 88 3b` (`mov [rbx], dil`) | `c6 03 01` (`mov [rbx], 1`) | Force `qt5IsOnscreen` = 1 in `qt5_early_prepare`. (iter7 patch, still applied) |
+| `0x48fe61` | `0f b6 10` (`movzx edx, [rax]`) | `b2 01 90` (`mov dl, 1; nop`) | Pass `true` to `MainWindow::MainWindow(UiInformation*, bool isOnscreen, QWidget*)` in `qt5_gui_init`. |
+| `0x389680` | `f3 0f 1e fa 48 8d ...` (30-byte function body) | `b8 01 00 00 00 c3` + 24× NOP | `vigs_qt5_onscreen_enabled()` always returns 1. Previously crashed on iter7 standalone, OK with the other two patches in place. |
+
+### qcow2 fix
+
+After many qemu-nbd mount/unmount + `kill -9` cycles, EXT4 journal on `/dev/vda2` (sysdata partition) got a checksum error. `e2fsck -fy /dev/nbd0p2` recovered. Future iterations: snapshot overlay before testing to avoid corrupting working overlay.
+
+### Boot observation with triple patch
+
+Emulator alive. sdb registers `emulator-26101 device hello_tv`. Kernel log shows enlightenment compositor running cleanly:
+```
+[5.908] lwipc: [2062 enlightenment] c#0 '/tmp/fms_ready', status=1
+[6.890] lwipc: [2062 enlightenment] D '/run/.wm_ready'
+[6.892] lwipc: [2062 enlightenment] D '/tmp/.wm_ready'
+[7.167] lwipc: [2062 enlightenment] D '/run/wm_start'
+[7.168] lwipc: [2062 enlightenment] D '/tmp/wm_start'
+[7.729] lwipc: [2062 enlightenment] D '/tmp/einfo_ready'
+```
+
+All WM-ready synchronization events fired by enlightenment. Boot proceeds past WM-ready gate. SMACK denials on `.wm_ready` continue (108 in 30s) but harmless — systemd reads the file's smack label which is wrong; the actual handshake happens via lwipc which works.
+
+**Host-side win confirmation**: in iter6 prior boot log we saw `vigs_offscreen_server_create:147 - VIGS_SYNC_READ_PIXELS: 1`. After triple patch in iter9, that line is **absent** — VIGS no longer creates an offscreen server. The `vigs_qt5_onscreen_enabled()` patch took effect; VIGS chose its onscreen code path.
+
+### Where we're still stuck
+
+`import -window <Tizen Emulator WID>` on the host X11 captures the actual MainWindow framebuffer (we know this captures correctly because the Samsung bezel art renders fine in the screenshot). The capture shows:
+- Outer bezel art with "SAMSUNG" branding: **rendered** by Qt5 widget paint
+- Inner TV canvas area where guest pixels should appear: **solid black, no content**
+
+So MainWindow exists as an X11 onscreen window, Qt paints its decoration, **but the VIGS pixel buffer is not being routed to the inner canvas widget**. The bridge between VIGS surface updates and MainWindow's repaint slot is broken or not connected when started under our patched code path.
+
+In `qt5_gui_init` disasm, right after `MainWindow::MainWindow(...)` returns:
+```
+0x48fe81: call method MainWindow::setCaptureRequestHandler(void*, void (*)(void*))
+  ; with rdx = obj.captureRequestHandler, rsi = obj.captureRequestListener
+```
+
+The capture-request-handler is the mechanism: VIGS notifies "new pixels ready" → handler triggers MainWindow repaint. `obj.captureRequestHandler` and `obj.captureRequestListener` are globals set elsewhere. To make pixels visible we need to either:
+1. Find where these globals are initialized and verify they get set in the onscreen path,
+2. OR find the missing signal/slot connection in MainWindow ↔ VIGS wiring.
+
+### Decision gate
+
+Iteration 9 ends at a deeper layer than expected. The pure flag-flipping has reached its limit. To progress further requires:
+
+- **Iter10**: disassemble the function(s) that set `obj.captureRequestHandler` / `obj.captureRequestListener` and follow how MainWindow actually receives VIGS pixel update notifications. Estimated 1–2 hours of RE, uncertain final patch shape.
+- **Or**: accept current state as "Approach B partial — host renders MainWindow chrome but VIGS pixel bridge missing" and stop. Headless dev pipeline (build + sign + install + AUL launch + Dart VM start) still works for non-UI test work.
+
+### Artifacts captured
+
+- `~/tizen-studio/platforms/tizen-10.0/tv-samsung/emulator/bin/emulator-x86_64` — patched (3 patches), original at `.orig`
+- `/tmp/em-iter9*.log` — boot logs
+- `/tmp/shots-popos/iter9-*.png` — screenshots
+- `/tmp/run_tv_no_tuner.sh` — reproducible launch script
+- Repaired qcow2 overlay (filesystems clean)

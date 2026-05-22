@@ -1767,3 +1767,22 @@ export EVAS_GL_PARTIAL_DISABLE=0
 
 **Decision**: continue to Task 2. Will create `/etc/profile.d/zz-evas-shm.sh` that overrides the GL settings from efl.sh (zz prefix ensures alphabetical-last execution). Will also test `WRT_USE_ONSCREEN_RENDERING=1` since web home-screen runs via wrt-loader.
 
+
+### Task 2 result — env vars injected into qcow2
+
+Wrote three files inside guest:
+- `/etc/profile.d/zz-evas-shm.sh` (login-shell env, runs after `efl.sh` alphabetically)
+- `/etc/systemd/system/user@.service.d/evas-shm.conf` (user systemd services)
+- `/etc/systemd/system.conf.d/evas-shm.conf` (system manager default env)
+
+Six env vars set in each:
+```
+ELM_ACCEL=none
+ELM_ENGINE=wayland_shm
+EVAS_RENDER_ENGINE=wayland_shm
+EVAS_ENGINE=wayland_shm
+EVAS_GL_DISABLE=1
+WRT_USE_ONSCREEN_RENDERING=1
+```
+
+The intent is that `EVAS_RENDER_ENGINE=wayland_shm` will make ecore_evas wayland engine pick the `wayland_shm` module instead of `wayland_egl`, `ELM_ACCEL=none` will stop Elementary from requesting GL accel, and `WRT_USE_ONSCREEN_RENDERING=1` may help wrt-loader (home-screen runtime) use sw composition.

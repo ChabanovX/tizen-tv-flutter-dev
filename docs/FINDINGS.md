@@ -2035,3 +2035,114 @@ The headless dev pipeline (build + sign + install + AUL launch + Dart VM Service
 - `/tmp/run_tv_no_tuner.sh` and `/tmp/run_tv_xephyr.sh` — launcher scripts
 - `/tmp/hello_tv_no_tuner.conf` — vm_launch.conf without WSI-dependent devices
 - This entire iteration history in `docs/FINDINGS.md` (iter1-10b)
+
+---
+
+## Iteration 11 — Ubuntu 22.04 jammy Docker (Samsung QA target distro)
+
+Iter10b's exit conclusion suggested the binary might have been QA'd on Ubuntu 22.04 jammy and that swapping the host Linux base might restore the pixel pipeline. We test that hypothesis with a Docker container running jammy and bind-mounting the emulator stack from the host.
+
+### Setup
+
+`~/tizen-docker-jammy/Dockerfile`:
+
+```dockerfile
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+RUN apt-get update && apt-get install -y software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa && apt-get update
+RUN apt-get install -y libpython3.8 python3.8 libicu70 libx264-163 \
+    libsdl1.2debian libsdl2-2.0-0 libwebkit2gtk-4.0-37 libcurl3-gnutls \
+    libglib2.0-0 libv4l-0 libkf5itemmodels5 libkf5kiowidgets5 libkchart2 \
+    libqt5gui5 libqt5widgets5 libqt5opengl5 libxcb-cursor0 libxcb-icccm4 \
+    libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+    libxcb-shape0 libxcb-xkb1 libxkbcommon-x11-0 libgl1-mesa-glx \
+    libglx-mesa0 libglu1-mesa libegl1-mesa locales xauth wmctrl xdotool \
+    imagemagick sudo curl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN locale-gen en_US.UTF-8 && useradd -u 1000 -m -s /bin/bash vld \
+    && echo "vld ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/vld
+USER vld
+WORKDIR /home/vld
+```
+
+Image: `tizen-emu-jammy` (1.55GB). Container UID 1000 == host vld so X11 socket auth and bind mounts are uid-clean.
+
+Run params (final form):
+- `--device /dev/kvm --group-add 993` (host kvm GID)
+- `-v /tmp/.X11-unix:/tmp/.X11-unix:rw`
+- `-v $HOME/tizen-studio:/home/vld/tizen-studio:ro`
+- `-v $HOME/tizen-studio-data:/home/vld/tizen-studio-data:rw`
+- `-e DISPLAY=:1 -e QT_QPA_PLATFORM=xcb -e LIBGL_ALWAYS_SOFTWARE=1`
+- `--network host`
+
+Host: `xhost +local:` to allow container connections.
+
+### Discriminators run inside jammy container
+
+| # | Variation | "show main window" | Window in `xwininfo -tree`? |
+|---|---|---|---|
+| 1 | `rendering=offscreen`, `backend=sw`, patched binary | yes | no |
+| 2 | `rendering=onscreen`, `backend=sw`, patched binary | yes | no |
+| 3 | (2) + `LIBGL_ALWAYS_SOFTWARE=1` | yes | no |
+| 4 | (3) but **unpatched** binary (from `.orig`) | yes | no |
+
+Across all four discriminators: emulator binary calls `mainwindow.cpp:350 show main window` log line, process stays alive in `S` (poll), holds X11 sockets in `/proc/13/fd`, and the host can list windows from inside the container via `wmctrl -l` (X11 connection verified). **Yet no QEMU emulator window ever appears** — neither `wmctrl -l` nor `xwininfo -root -tree` on host shows a window from the container's emulator process.
+
+### What this proves
+
+The walls we've now ruled out:
+1. ✗ Cosmic Wayland (iter10: mobile emulator showed same black canvas)
+2. ✗ XWayland-vs-X11 (iter10b: Xephyr nested X showed same black)
+3. ✗ Host Linux distro (iter11: jammy container behaves identically to host noble)
+4. ✗ Mesa libGL/Nouveau driver attempt (`LIBGL_ALWAYS_SOFTWARE=1` — no change)
+5. ✗ Binary patches (iter9 qt5_early_prepare + qt5_gui_init + vigs_qt5_onscreen_enabled patches — unpatched .orig binary shows the same failure mode in onscreen mode)
+6. ✗ rendering=offscreen vs onscreen (conf-level switch — both fail to produce visible window in this environment)
+
+### What's actually going on
+
+The emulator binary v2.8.0.38 (built 2025-11-20) on every Linux environment we've tested:
+- `Display Type: QT5 Onscreen` (or Offscreen) is logged correctly per conf
+- `mainwindow.cpp:350 show main window` is hit
+- VIGS device initializes
+- But VIGS never logs `vigs_offscreen_server_create` or `vigs_onscreen_server_create` in any of these test configurations
+- Qt5 process holds X11 socket, but never calls XMapWindow on a visible widget
+
+The pixel pump (VIGS server → QImage/QPainter → Qt widget → XMapWindow) is **never wired** by this binary in our test stack. This is invariant across:
+- 4 host environments (Cosmic-Wayland-via-XWayland / Xephyr-native-X11 / Docker noble / Docker jammy)
+- Both render modes (offscreen / onscreen)
+- Both backends (gl / sw)
+- Both patch states (iter9-patched / unpatched)
+
+### Conclusion
+
+The wall is **inside this specific binary build** of the Samsung emulator, and it's not unlocked by any environment-level intervention available without source-level changes. This is consistent with the Samsung emulator-x86_64 v2.8.0.38 build being broken or incomplete for any Linux host that's not the exact internal Samsung target (presumably an internal Samsung CI image with a custom Qt5 + Mesa + VIGS-DRI integration we don't have).
+
+What's left from this entire session as a working deliverable:
+
+- **Headless dev pipeline** is fully functional:
+  - Flutter app built and signed by `flutter-tizen` with the `gcc`-compiler patch
+  - TPK installed into guest via Samsung-issued certs from the Mac
+  - App launched via AUL, runs to completion
+  - Dart VM Service starts inside guest (libflutter_tizen.so patched at 0x49703 to bypass the "display was not valid" abort)
+  - Guest reaches boot completion, enlightenment runs cleanly, `.wm_ready` events fire
+  - sdb (Tizen's adb) shell access to running app
+- **What's NOT functional**: visible UI from the emulator. The emulator binary's pixel pipeline is broken/incomplete on every environment available to us.
+
+### Paths still on the table (untaken)
+
+- **Real Samsung TV hardware** in dev mode — bypasses emulator entirely; no equivalent investment beyond purchase
+- **Tizen Studio 5.x with LLVM-10 toolchain** — older Samsung emulator stack that predates whatever broke in 2.8.0.38; would require switching the entire toolchain and reworking the Flutter build pipeline
+- **GDB on running emulator + symbol-less RE** — find the missing wiring between VIGS and Qt MainWindow; weeks of work with uncertain payoff and likely binary-version-specific result
+- **Wait/escalate to Samsung** — file an SDK bug. Samsung confirmed v2.8.0.38 was released 2025-11; there's a reasonable chance a v2.9.x fixes this. Not actionable on weekend timeline.
+
+### Artifacts (iter11 additions)
+
+- `~/tizen-docker-jammy/Dockerfile` — Docker image source
+- `tizen-emu-jammy` Docker image (1.55GB) — Samsung's likely QA target distro, pre-built for fast re-test if a future Samsung emulator build fixes the pipeline
+- `~/tizen-studio/platforms/tizen-10.0/tv-samsung/emulator/bin/emulator-x86_64.patched` — iter9 patches preserved for archive
+- `~/tizen-studio/platforms/tizen-10.0/tv-samsung/emulator/bin/emulator-x86_64` — restored to unpatched (matches `.orig` byte-for-byte) since patches don't help
+- `~/tizen-studio/platforms/tizen-10.0/tv-samsung/emulator/bin/emulator-x86_64.orig` — original Samsung binary (unchanged)
+- `/tmp/hello_tv_no_tuner_sw.conf` — vm_launch.conf with `backend=sw, rendering=offscreen`
+- `/tmp/hello_tv_no_tuner_onscreen.conf` — vm_launch.conf with `backend=sw, rendering=onscreen`
+- `/tmp/run_tv_jammy.sh` and `/tmp/run_tv_jammy_onscreen.sh` — container launcher scripts
+

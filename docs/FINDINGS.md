@@ -2146,3 +2146,66 @@ What's left from this entire session as a working deliverable:
 - `/tmp/hello_tv_no_tuner_onscreen.conf` — vm_launch.conf with `backend=sw, rendering=onscreen`
 - `/tmp/run_tv_jammy.sh` and `/tmp/run_tv_jammy_onscreen.sh` — container launcher scripts
 
+---
+
+## Iteration 12 — Cross-version A/B test (BREAKTHROUGH: regression confirmed in v10 binary)
+
+The iter11 conclusion ("architectural wall, no environment-level fix") had a hole: we never compared the TV-10.0 emulator binary against a *different version* of the Samsung emulator binary on the same host. Iter12 closes that gap.
+
+### Setup
+
+- New screenshot pipeline: switched to **Xvfb** at `:99` running `4096x1200x24` headless framebuffer in RAM. Independent of physical monitor state, independent of Cosmic compositor, independent of any window manager. All testing now done via `import -window root` from Xvfb.
+- Verified Xvfb works correctly: xclock renders cleanly with visible analog face.
+- Installed older Samsung emulator binary via package-manager-cli: `MOBILE-6.0-Emulator` (Tizen 6.0 mobile platform). Binary at `~/tizen-studio/platforms/tizen-6.0/common/emulator/bin/emulator-x86_64`, file size 62MB, **not stripped, has debug_info** (unlike the v10 binary which is stripped).
+
+### A/B result
+
+| Variant | Binary path | Build year (approx) | `vigs_offscreen_server_create` logged? | Skin window in xwininfo? | Inner canvas pixels? |
+|---|---|---|---|---|---|
+| **TV-Samsung 10.0** | `platforms/tizen-10.0/tv-samsung/emulator/bin/emulator-x86_64` | 2025-11-20 | ❌ never | ❌ never | n/a |
+| **Mobile 6.0** | `platforms/tizen-6.0/common/emulator/bin/emulator-x86_64` | ~2020 | ✅ yes | ✅ yes (`0x400004 "Tizen Emulator"` 424x681) | ✅ yes (full skin + Samsung's "display switched off" overlay, indicating canvas is being painted) |
+
+Same Pop!_OS host, same KVM, same Xvfb :99 X server, same `QT_QPA_PLATFORM=xcb`, same `wsi=vigs_wsi`. The only difference is the emulator binary itself.
+
+### What this proves
+
+- **The wall is a regression introduced into the Samsung TV emulator binary build v2.8.0.38 (2025-11-20).** It is not an environment-level issue. The Samsung emulator binary code path that wires VIGS into the maru_qt5 MainWindow exists and works in older builds; it has broken or been disabled in the current TV-Samsung-10.0 build.
+- All iter9–iter11 environment work — Xephyr, jammy Docker, QT_QPA_PLATFORM, LIBGL_ALWAYS_SOFTWARE, binary patches — was useless. The bug is upstream in the binary.
+
+### What remains to figure out
+
+1. Is the regression in *all* v10 emulator binaries (mobile + wearable + tv-samsung) or only in tv-samsung-10.0? — install `TIZEN-8.0-Emulator` and `TIZEN-9.0-Emulator` (public Tizen TV builds with different binary dates) and re-test.
+2. If the regression is narrow to tv-samsung-10.0, is there a tv-samsung-9.0 / tv-samsung-8.0 emulator binary available anywhere? — package-manager-cli does not list one; only TV-SAMSUNG-Public-Emulator 10.0.0 is in the catalog. Possible avenues: extra Samsung repositories, Tizen Studio 6.0 archive installer (predates v2.8.0.38), Samsung Smart TV developer support.
+3. For pragmatic Flutter UI work *today*, can we cross-compile/deploy a Flutter Tizen app for the older mobile-6.0 platform that we know renders? — Mobile-6.0 vs TV-10.0 are different Tizen API levels and the Flutter embedder expects TV. May or may not be a viable workaround.
+4. Note: the older binary has **debug_info intact**. If we need to RE for any reason, mobile-6.0 binary is the right one to read for understanding maru_qt5 + VIGS wiring (since it works), and then diff/locate the broken codepath in v10.
+
+### Artifacts
+
+- `~/tizen-studio/platforms/tizen-6.0/common/emulator/bin/emulator-x86_64` — mobile-6.0 emulator binary (working reference, has debug symbols)
+- `~/tizen-studio-data/emulator/vms/M-6.0-x86/` — pre-built mobile-6.0 VM image
+- `/tmp/run_mobile60.sh` — launcher with `DISPLAY=:99 QT_QPA_PLATFORM=xcb`
+- Xvfb daemon: `Xvfb :99 -screen 0 4096x1200x24 -ac` (running headless)
+- Screenshot: visible mobile emulator skin in upper-left of 4096x1200 Xvfb framebuffer (mac-side path `/tmp/mobile60-root.png` for archive)
+
+### Iter12 follow-up — Tizen 10 public + Tizen 8 app deploy attempts
+
+Confirmed cross-version data by also installing TIZEN-8.0-Emulator and TIZEN-9.0-Emulator and testing the 10.0 public emulator already present:
+
+| Emulator | Package | Build | Window? | App-deploy outcome |
+|---|---|---|---|---|
+| Mobile 6.0 | 2.8.0.33 (Samsung-branch) | 2020-09-23 | ✅ | (not attempted — Mobile profile not target) |
+| Tizen 8.0 public | 5.0.3.2 (Tizen-branch) | 2023-06-07 | ✅ | install fails `-4 Operation not allowed` (signature mismatch) |
+| Tizen 10.0 public | 5.0.3.6 (Tizen-branch) | 2025-09-11 | ✅ (boot console visible in canvas) | install fails `-15 Configuration error` ← caused by guest `/opt` 100% full (crash dumps accumulated). After `rm -rf /opt/usr/share/crash/*` → install succeeds, `app_launcher --start` returns PID, but Runner.dll exits immediately. `buxton` config service is `inactive` on Tizen-10 public emulator → all `vconf_*` calls fail → launchpad cascading errors. `systemctl is-system-running` reports `degraded`. Wayland is up (`/run/wayland-0` socket, enlightenment PID 2379, `/run/.wm_ready` file present) but app crashes before drawing. |
+| TV-Samsung 10.0 | 2.8.0.38 (Samsung-branch) | 2025-11-20 | ❌ | n/a |
+
+So getting hello_tizen_tv UI visible via the *public* Tizen 10 emulator was almost-but-not-quite the solution: the emulator binary creates a window (unlike TV-Samsung-10), and the package installs cleanly, but the runtime environment is too broken (no buxton, degraded boot) for a .NET-based Flutter app to actually launch.
+
+This brings the situation back to a clear set of options:
+
+1. **File Samsung SDK bug for emulator-x86_64 v2.8.0.38 TV-Samsung regression** — actionable, evidence is now strong (we can show a side-by-side: same machine, same VM-style conf, same Qt5 platform, but TV-Samsung-10 creates no window while public-Tizen-10 does). Wait for next Samsung release.
+2. **Real Samsung TV in dev mode** — hardware purchase needed, but the entire headless dev pipeline (Flutter build, sign, sdb push, AUL launch, Dart VM Service) is verified working — it will deploy to a real TV unchanged.
+3. **Debug buxton on Tizen-10 public** to make app launch work there — likely a known issue with the Tizen 10 public emulator build; further effort with uncertain payoff and not a TV target anyway.
+4. **GDB / RE diff between mobile-6.0 (working, has debug symbols) and TV-Samsung-10.0 (stripped, broken)** to find the exact regression point — weeks of work.
+
+Recommendation: option 1 + option 2 as the realistic path.
+

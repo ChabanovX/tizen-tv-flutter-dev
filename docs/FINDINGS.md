@@ -1925,3 +1925,56 @@ Iteration 9 ends at a deeper layer than expected. The pure flag-flipping has rea
 - `/tmp/shots-popos/iter9-*.png` — screenshots
 - `/tmp/run_tv_no_tuner.sh` — reproducible launch script
 - Repaired qcow2 overlay (filesystems clean)
+
+---
+
+## Iteration 10 (2026-05-22, Linux — discriminator pivot)
+
+### The big realization
+
+After three iterations of deep binary RE on `emulator-x86_64` (qt5_early_prepare, qt5_gui_init, vigs_qt5_onscreen_enabled patches, captureRequestHandler vtable investigation), advisor pushed for a discriminator we'd been avoiding: **screenshot the mobile emulator's inner canvas, not just the TV one**.
+
+Mobile uses a different binary (`common/emulator/bin/emulator-x86_64`) with no patches from us. We launched it via the existing `/tmp/run_mobile.sh` (created in iter6) and captured the inner canvas.
+
+**Result: mobile canvas is also solid black.** Side-panel decoration widgets (home/back/volume buttons) render fine. Inner TV canvas where guest pixels should appear — black, just like TV.
+
+Conclusion: the wall is **not TV-specific binary behavior** — it's the host environment. **Pop!_OS Cosmic Wayland + Qt 5.6 (from 2016) cannot correctly render Qt5's framebuffer canvas widget through Cosmic's XWayland connector.** Outer skin chrome works because that uses standard X11 widget primitives that XWayland passes through. Inner canvas uses Qt5's QImage / framebuffer rendering which Cosmic doesn't display.
+
+### Why our RE work didn't show progress
+
+All three binary patches **did work as designed** — but they were patching the wrong layer:
+- qt5_early_prepare → qt5IsOnscreen=1 ✓
+- qt5_gui_init → MainWindow(bool=1) ✓
+- vigs_qt5_onscreen_enabled → return 1 ✓
+
+The emulator binary then went into "onscreen mode" code path correctly. But "onscreen" here means "render pixels into Qt5 canvas widget surface", which Cosmic Wayland doesn't show. Same wall hits the mobile binary which didn't need any patches.
+
+The additional finding (no `vigs_onscreen_server_create` line either, no `vigs.*server` line at all in TV log) suggests our patches may have made VIGS take a **third** path — neither offscreen-server nor onscreen-server — but that's a downstream effect of the architecture mismatch, not the root cause.
+
+### Real solutions (host environment, not binary)
+
+1. **Boot Pop!_OS Cosmic in X11 session** if such option exists in login manager
+2. **Xephyr / Xvfb** — nested X server isolated from Cosmic compositor, then run emulator inside that nested X. Emulator's Qt5 canvas writes pixels that the nested X server displays, Cosmic shows the Xephyr window like any other window.
+3. **Different Linux distro** with classical X11 stack (Ubuntu 22.04 / older Pop!_OS / Debian GNOME-X11 session)
+4. **VNC**: run emulator headless in Xvfb on this box, view via VNC from any client (including Cosmic via vncviewer)
+
+### What's still valid from iter6-9 work
+
+- Pop!_OS Linux x86_64 + KVM + NVIDIA OpenGL: VIGS GL backend initializes cleanly (`Using OpenGL 3.1+ core`, `GL_VENDOR = NVIDIA`)
+- shm env vars in qcow2 (iter8 task2) work — enlightenment runs, `.wm_ready` lwipc events fired, boot completes
+- Samsung-issued cert profile enables `pkgcmd install` success
+- libflutter_tizen.so binary patch (iter8 task6) lets Dart VM Service start
+- flutter-tizen build pipeline produces signed TPK with `gcc` compiler patch
+- Emulator binary patches in iter9 are harmless (still works correctly, just don't solve UI display)
+
+The entire **headless dev pipeline** is preserved and working. Only the visual display is blocked by host environment.
+
+### Decision gate
+
+Three paths:
+
+**A. Try Xephyr nested X server** (1-2 hours): install Xephyr, launch emulator inside it. If pixels appear in Xephyr window — quickest path to visual emulator on Pop!_OS. **Recommended next step.**
+
+**B. Boot a different X11-native session** (depends on whether Pop!_OS allows): GDM/lightdm login type switching. If user can choose X11 instead of Cosmic Wayland at login, might be 5-minute test.
+
+**C. Accept and stop**: document state, ship headless pipeline as the deliverable. UI development on Linux requires Pop!_OS swap or different VM.

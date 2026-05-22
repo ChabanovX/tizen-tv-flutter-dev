@@ -1743,3 +1743,27 @@ Plan: `docs/superpowers/plans/2026-05-22-approach-a-efl-shm-backend.md`.
 
 Hypothesis: forcing `EVAS_RENDER_ENGINE=wayland_shm` system-wide lets EFL apps render without `eglGetDisplay()`, which unblocks enlightenment → `.wm_ready` → boot completion → TV home screen rendering. Flutter embedder then runs with `--enable-software-rendering` and writes Skia frames to a Wayland shm buffer.
 
+
+### Task 1 result — guest EFL engine inventory
+
+**Excellent finding**: guest qcow2 has full set of EFL engines:
+- `/usr/lib64/evas/modules/engines/wayland_shm/v-1.25/` — **the software backend we want**
+- `/usr/lib64/evas/modules/engines/wayland_egl/v-1.25/` — currently used, fails
+- Also: `buffer`, `gl_generic`, `gl_tbm`, `software_tbm` — multiple software paths
+- `/usr/lib64/ecore_evas/engines/{extn,tbm,wayland}/v-1.25/module.so` — wayland ecore_evas multiplexes shm/egl by env var
+
+**Why apps currently choose GL**: `/etc/profile.d/efl.sh` literally sets:
+```
+export ELM_ACCEL="gl"
+export ELM_ENGINE=gl
+export EVAS_GL_NO_BLACKLIST=1
+export EVAS_GL_EGL_SYNC_ON=1
+export EVAS_GL_PARTIAL_DISABLE=0
+```
+
+**Other relevant scripts** in `/etc/profile.d/`:
+- `enlightenment.sh` — sets `TIZEN_CURSOR_ENABLE`, `XDG_RUNTIME_DIR`, `TIZEN_WAYLAND_SHM_DIR=/run/.efl`
+- `wrt_env.sh` — has `WRT_USE_ONSCREEN_RENDERING=` (empty — set to "1" might force onscreen for WRT apps)
+
+**Decision**: continue to Task 2. Will create `/etc/profile.d/zz-evas-shm.sh` that overrides the GL settings from efl.sh (zz prefix ensures alphabetical-last execution). Will also test `WRT_USE_ONSCREEN_RENDERING=1` since web home-screen runs via wrt-loader.
+

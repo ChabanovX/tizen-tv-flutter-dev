@@ -2504,6 +2504,128 @@ Visible Flutter UI on the Linux emulator is firmly gated by **missing YAGL hardw
 
 ---
 
+## Iteration 18 — Mesa swrast cross-build + guest install + Samsung COREGL ABI wall
+
+Per request to keep going on cross-compiling Mesa: built Mesa 26.2.0-devel from main branch on host (Pop!_OS), installed in guest qcow2.
+
+### Setup
+
+- Installed build deps: `meson`, `ninja`, `python3-mako`, `bison`, `flex`, `libwayland-dev`, `libwayland-egl-backend-dev`, `wayland-protocols`, `libdrm-dev`, `libxext-dev`, `libxxf86vm-dev`, `libxdamage-dev`, `libxshmfence-dev`, `libxrandr-dev`, `libffi-dev`, `zlib1g-dev`, `libelf-dev`, `libstdc++-13-dev`.
+- Upgraded meson via pip (system 1.3.2 too old, Mesa requires 1.4+): `pip install --user --break-system-packages --upgrade meson` → 1.11.1.
+- Cloned `https://gitlab.freedesktop.org/mesa/mesa.git` (main branch — no -b 24.3 release branch exists at clone time).
+
+### Meson configure (final working invocation)
+
+```bash
+meson setup ~/mesa-build \
+    --prefix=$HOME/mesa-install \
+    --buildtype=release \
+    -Dgallium-drivers=softpipe \
+    -Dvulkan-drivers= \
+    -Dplatforms=wayland \
+    -Degl=enabled \
+    -Dgles1=enabled \
+    -Dgles2=enabled \
+    -Dglx=disabled \
+    -Dglvnd=disabled \    # critical: without this, only libEGL_mesa.so vendor library is built
+    -Dllvm=disabled \
+    -Dvideo-codecs= \
+    -Dlmsensors=disabled \
+    -Dlibunwind=disabled \
+    -Dvalgrind=disabled \
+    -Dzstd=disabled
+```
+
+Build: `ninja -C ~/mesa-build install`. ~10 minute build. Output libs:
+- `libEGL.so.1.0.0` (470 KB) — standalone EGL with Wayland platform support
+- `libGLESv2.so.2.0.0` (59 KB)
+- `libGLESv1_CM.so.1.1.0` (33 KB)
+- `libgbm.so.1.0.0` (27 KB)
+- `libgallium-26.2.0-devel.so` (22 MB) — softpipe driver runtime
+- `gbm/dri_gbm.so` (156 KB) — the loadable DRI driver
+
+### Install in guest (via qemu-nbd qcow2 mount)
+
+| Target | Source | Notes |
+|---|---|---|
+| `/usr/lib64/driver/libEGL.so.1.0` | Mesa libEGL.so.1.0.0 | replacing Samsung's YAGL impl |
+| `/usr/lib64/driver/libGLESv2.so.2.0` | Mesa libGLESv2.so.2.0.0 | same |
+| `/usr/lib64/driver/libGLESv1_CM.so.1.0` | Mesa libGLESv1_CM.so.1.1.0 | same |
+| `/lib64/libgallium-26.2.0-devel.so` | Mesa libgallium | dependency of Mesa libEGL |
+| `/lib64/libgbm.so.1.0.0` + symlink `libgbm.so.1` | Mesa libgbm | dependency of Mesa libEGL |
+| `/usr/lib64/gbm/dri_gbm.so` | Mesa gbm/dri_gbm.so | DRI driver |
+| `/opt/usr/home/vld/mesa-install/lib/x86_64-linux-gnu/gbm/dri_gbm.so` | symlink/copy | satisfies Mesa's compile-time hardcoded fallback path |
+| `/etc/profile.d/zz-mesa.sh` + `/etc/systemd/system.conf.d/mesa-env.conf` | env vars: `LIBGL_DRIVERS_PATH=/usr/lib64/gbm`, `GBM_BACKEND=dri`, `MESA_LOADER_DRIVER_OVERRIDE=swrast`, `LIBGL_ALWAYS_SOFTWARE=1` |
+
+All files set with SMACK label `_` (floor) to match Tizen system convention.
+
+### What worked
+
+- Mesa libs load cleanly. No more `MESA-LOADER: failed to open dri` after putting dri_gbm.so at compile-time hardcoded fallback path.
+- The earlier `evas-wayland_egl ... eglGetDisplay() fail. code=0` from iter15-17 is GONE.
+- No more "Critical error! Unable to open YaGL kernel device" — Mesa libEGL doesn't need /dev/yagl.
+
+### What doesn't — the COREGL ABI wall
+
+Samsung's userspace EGL stack is two-layered:
+- `/usr/lib64/libEGL.so.1.4` (47 KB) — **Samsung COREGL wrapper** with Tizen-specific dispatch
+- `/usr/lib64/driver/libEGL.so.1.0` (122 KB) — **YAGL driver** (now replaced with Mesa 470 KB libEGL)
+
+Loading apps go through COREGL wrapper which dlopens the driver. With Mesa as the driver:
+
+```
+[6.273997] /usr/bin/enlightenment: error while loading shared libraries: libgbm.so.1: cannot open shared object file: Error 117
+```
+
+Fixed by re-creating broken libgbm.so.1 symlink + ext4 fsck (qemu-nbd mount/umount cycles had introduced FS journal inconsistency).
+
+After fix, next failure:
+
+```
+[7.135339] enlightenment[1755]: segfault at 369 ip 00007f685aa8c1e0 in libc.so.6
+[6.447312] MESA-EGL: warning: invalid EGL_PLATFORM given
+```
+
+enlightenment compositor segfaults in libc string functions at offset ~0x681e0 from libc base. Likely strlen(NULL) on a vendor/extension string that Samsung COREGL expects from the driver but Mesa doesn't provide in the same format.
+
+Also tried replacing the wrapper layer too (libEGL.so.1.4 = Mesa libEGL): same segfault. Reverted to: Samsung COREGL wrapper + Mesa driver.
+
+### Architecture of the remaining wall
+
+Samsung's COREGL wrapper expects driver to provide:
+- Standard EGL functions ✓ (Mesa has these)
+- Samsung-specific entry points (yagl_*, COREGL hooks for fastpath) ❌ (Mesa doesn't have these)
+- Vendor strings in specific format ❓ (Mesa returns "Mesa", may break Samsung's parser)
+- EGL extensions Samsung apps rely on (EGL_WL_bind_wayland_display, etc.) ❓
+
+Each Samsung-specific entry point/extension that's missing causes a downstream failure (NULL deref, garbage state) inside the Samsung side.
+
+### Path to ACTUALLY get this working
+
+Would require any of:
+
+1. **LD_PRELOAD shim library** that interposes between Samsung COREGL and Mesa. Provides Samsung-specific yagl_* entry points as stubs, transforms EGL/GLES calls to Mesa's API. Multi-day C dev work.
+
+2. **Custom Mesa build with Samsung-compat shim** baked in. Modify Mesa source to expose Samsung COREGL extensions / vendor strings expected by Tizen. Days.
+
+3. **Patch Samsung COREGL wrapper** binary to skip Samsung-specific extension checks. Find the strlen-NULL crash site via gdb, patch the deref. Possible but iterative.
+
+4. **Skip Samsung wrappers entirely** — change `/usr/lib64/libEGL.so.1` symlink to point directly at Mesa libEGL. Apps that hardcode COREGL paths still fail. Tried partial form, didn't fully unstick.
+
+5. **Real Samsung TV hardware** — bypasses entire problem space. Remains the most pragmatic.
+
+### State at end of iter18
+
+- Mesa builds successfully on host (~/mesa-install/)
+- Mesa libs installed in guest qcow2 at driver/ level
+- Boot reaches enlightenment which crashes on init due to COREGL ↔ Mesa ABI gap
+- Samsung COREGL wrappers preserved (segfaulted equally with wrapper-Mesa too)
+- AVE/TVS service masks lost in golden restore — re-applying would help reduce noise but doesn't fix the EGL crash
+
+This is the deepest we can go without writing a real LD_PRELOAD shim or patching Samsung COREGL. Visible Flutter UI in TV-Samsung-10 emulator on Linux remains blocked by the multi-day RE work above OR real hardware.
+
+---
+
 ## Iteration 16 — Offline install via qcow2-mount → app launched but no visible render
 
 Since sdb shell was unreliable, used qemu-nbd mount to inject the TPK directly into guest filesystem and add a systemd oneshot service that runs `pkgcmd -i` + `app_launcher` at boot.

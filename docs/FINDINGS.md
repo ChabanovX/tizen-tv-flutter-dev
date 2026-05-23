@@ -2403,6 +2403,107 @@ Attempted to deploy hello_tizen_tv on TV-Samsung-10 emulator running on Xvfb. Mu
 
 ---
 
+## Iteration 17 — Binary RE on guest YAGL: root cause confirmed, hardware emulation gap
+
+Per request to keep digging "until visible Flutter UI achieved", pulled guest `/usr/lib64/driver/libEGL.so.1.0` (Samsung's YAGL, 122 KB) to host. Analyzed eglGetDisplay and related functions in objdump + python binary scan.
+
+### YAGL libEGL: eglGetDisplay control flow
+
+```
+eglGetDisplay(native_display):
+  call yagl_check_gpu_available
+    → stat("/dev/yagl")
+    → if not character device → return 0
+  if 0 → return EGL_NO_DISPLAY  (THIS IS WHERE WE WERE STUCK)
+  
+  getenv("EGL_PLATFORM"), getenv("EGL_DISPLAY")
+  call yagl_tizen_platform vtable
+  pthread_once(yagl_displays_init_once)
+  ...
+```
+
+### Patch applied (iter17a)
+
+Patched `yagl_check_gpu_available` at file offset 0x66f0 in libEGL.so.1.0 with `b8 01 00 00 00 c3 90` (`mov eax,1; ret; nop`). Preserves SMACK label via in-place edit (xattrs on inode survive byte modification).
+
+### What happens after the patch
+
+Booting emulator with patched libEGL, the klog no longer shows `evas-wayland_egl ... eglGetDisplay() fail. code=0`. Progress.
+
+**But immediately hits a new error inside libEGL:**
+```
+[1.602945] yagl: module loaded
+Critical error! Unable to open YaGL kernel device: No such file or directory!
+```
+
+Found this error in libEGL.so.1.0 at `yagl_get_state` (around 0x9af0). The function:
+1. `yagl_malloc0(0x78)` — allocate state struct
+2. `open("/dev/yagl", O_RDWR|O_NONBLOCK|O_CLOEXEC)` — open the kernel device
+3. If open fails, retry 10 times with usleep
+4. If all fail → `exit(1)` with the error message
+5. If open succeeds → `ioctl(fd, 0x80045900, ...)` and `ioctl(fd, 0x800c5901, ...)` to set up YAGL state
+6. Returns the state struct
+
+### The actual hardware gap
+
+Kernel log says `yagl: module loaded` — the YAGL kernel driver IS in this guest. But no `/dev/yagl` is created. Why?
+
+The Linux YAGL kernel module is a driver for a specific PCI device. To create `/dev/yagl`, the driver needs to find that PCI device. The TV-Samsung-10 emulator QEMU command line has:
+
+```
+-device vigs,backend=gl  # present
+-device virtio-maru-*    # present (touchscreen, sensor, etc.)
+... NO -device yagl,...  # MISSING
+```
+
+Comparison with Wearable 6.5 (working): also no `-device yagl,...`. But Wearable apps render via wayland_shm (software path) — they never invoke libEGL.
+
+Searching the TV-Samsung-10 emulator binary `strings` for `yagl` device class — only mentions in error messages, no `qom-type:yagl` device definition. **The Samsung emulator binary v2.8.0.38 was built without yagl QEMU device implementation.**
+
+### Why this is the wall
+
+The chain to get visible Flutter UI:
+1. `libflutter_tizen.so` (Flutter Tizen embedder) — uses `ecore_wl2 + wayland_egl + tdm_client`. No software fallback.
+2. `evas-wayland_egl` engine — needs `libEGL.so.1.4` (COREGL dispatcher) which calls `libEGL.so.1.0` (YAGL impl).
+3. YAGL impl needs `/dev/yagl` (a Samsung-internal protocol over a PCI device).
+4. QEMU emulator binary doesn't expose the yagl PCI device → kernel module loads but binds to nothing → no `/dev/yagl` created → libEGL can't initialize → every app using GLES fails.
+
+This affects EVERY app in the guest that wants GLES: Samsung's pre-installed homescreen, csfs, wrt-loader, taskbar, volume-app — and our Flutter app.
+
+### Cascading patch attempt — abandoned
+
+Considered:
+- Replace `/dev/yagl` string with `/dev/null` (same length, in-place edit works) → makes open() succeed but ioctls fail with ENOTTY
+- Patch ioctl checks to ignore -1 → function returns garbage state
+- Cascading patches needed throughout `yagl_get_state`, `yagl_marshal_*`, all GL command marshaling functions
+
+Each patch creates downstream failures because the rest of YAGL code expects real ioctl responses from real hardware emulation. Without that, the patched code returns garbage GL state — even if app doesn't crash, it can't render anything visible. Binary patching cannot synthesize the missing hardware emulation layer.
+
+### What WOULD work (multi-day or hardware)
+
+1. **Cross-compile Mesa with software EGL (swrast) for Tizen 10 guest** — replace `/usr/lib64/driver/libEGL.so.1.0`, `libGLESv2.so.2.0`, etc. with Mesa builds that use CPU rendering. Mesa swrast doesn't need a hardware device. Multi-day cross-compile work given a working Tizen 10 sysroot.
+
+2. **Patch QEMU to add yagl device emulation** — would require reimplementing the YAGL host-side protocol (Samsung-internal). Weeks of work without Samsung's source.
+
+3. **Real Samsung TV in dev mode** — real device has Mali GL drivers, no YAGL needed. Pipeline ships immediately.
+
+4. **Wait for Samsung emulator fix** — file SDK bug. Months.
+
+### Current state of guest qcow2
+
+- `/usr/lib64/driver/libEGL.so.1.0` — patched at 0x66f0 (yagl_check_gpu_available → mov eax,1; ret). Original at `.orig` next to it.
+- `hello-flutter.service` from iter16 still present — auto-installs + launches hello_tizen_tv on boot.
+- TV-Samsung-10 emulator window opens on Xvfb :99 with Samsung TV bezel + remote visible.
+- App installs (klog "install completed") and AUL launches it, but AMD foreground timer expires because no Wayland surface created.
+
+### Stopping point
+
+Visible Flutter UI on the Linux emulator is firmly gated by **missing YAGL hardware emulation in the QEMU binary**. The patch we applied confirmed the root cause but cannot synthesize the missing hardware. Further binary patches cascade indefinitely without solving the fundamental gap.
+
+**Practical recommendation unchanged**: real Samsung TV hardware is the realistic path. Headless dev pipeline is verified working end-to-end (build → sign → install → AUL → Dart VM Service starts) and deploys directly to real hardware.
+
+---
+
 ## Iteration 16 — Offline install via qcow2-mount → app launched but no visible render
 
 Since sdb shell was unreliable, used qemu-nbd mount to inject the TPK directly into guest filesystem and add a systemd oneshot service that runs `pkgcmd -i` + `app_launcher` at boot.

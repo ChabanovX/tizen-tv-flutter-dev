@@ -2228,3 +2228,41 @@ This brings the situation back to a clear set of options:
 
 Recommendation: option 1 + option 2 as the realistic path.
 
+---
+
+## Iteration 13 — Tier-4 sweep: regression bracketed to 2.8.0.36–38
+
+After committing the bug report draft, did one more cheap sweep before stopping: install every available Tizen Studio emulator package (`COMMON/MOBILE/WEARABLE-N.N-Emulator` for N=6,6.5,7,8,9) and probe each binary's `Package Version` + `Build date` by briefly launching it.
+
+### Full version map
+
+| Platform installer | Binary version | Build | Stripped? | Branch |
+|---|---|---|---|---|
+| MOBILE-6.0-Emulator | 2.8.0.33 | 2020-09-23 | debug_info | Samsung-fork |
+| **WEARABLE-6.5-Emulator** | **2.8.0.36** | **2021-09-09** | **debug_info** | **Samsung-fork** |
+| WEARABLE-7.0-Emulator | 5.0.2.2 | 2022-09-28 | (not checked) | upstream |
+| TIZEN-8.0-Emulator | 5.0.3.2 | 2023-06-07 | (not checked) | upstream |
+| TIZEN-9.0-Emulator | 5.0.3.3 | 2024-02-01 | (not checked) | upstream |
+| TIZEN-10.0-Emulator | 5.0.3.6 | 2025-09-11 | (not checked) | upstream |
+| TV-SAMSUNG-Public-Emulator 10.0.0 | **2.8.0.38** | 2025-11-20 | **stripped** | Samsung-fork |
+
+The Samsung-fork (2.8.0.x) is the regressed branch. The upstream Tizen line (5.0.3.x) is parallel and works. Critically, **2.8.0.36** from 2021 is much closer in time to 2.8.0.38 (2025) than our prior 2.8.0.33 reference — and it ALSO has full debug symbols.
+
+### Wearable 6.5 visual verification
+
+Launched W-6.5-circle-x86 on Xvfb :99. Result: **full watch face GUI renders** — circular skin, animated hour/minute hands, moonphase indicator, date "24" complication, decorative bezel text rotating around the rim. Not just an empty canvas — the entire wearable demo UI. Same emulator-x86_64 binary family as TV-Samsung-10, just three minor versions older.
+
+### Implications
+
+- **Regression is bracketed to at most one or two intermediate Samsung-fork builds (2.8.0.37 / final .38)**. The .37 build, if it ever existed publicly, is not in the current package repository.
+- **The closest known-good comparison binary now has debug symbols**. For Tier-2 GDB work (RE diff to find regression point), `tizen-6.5/common/emulator/bin/emulator-x86_64` is the right reference: its `vigs_offscreen_server_create` call chain can be walked with named functions, then matched against the stripped 2.8.0.38 binary by signature.
+- Stripped vs not-stripped is the only externally-visible build process change between working 2.8.0.36 and broken 2.8.0.38. Worth flagging in the bug report.
+
+### Artifacts
+
+- `~/tizen-studio/platforms/tizen-6.5/common/emulator/bin/emulator-x86_64` (62.5MB, debug_info, 2.8.0.36)
+- `~/tizen-studio-data/emulator/vms/W-6.5-circle-x86/` — pre-built VM image
+- `/tmp/run_w65.sh` — launcher script (DISPLAY=:99, QT_QPA_PLATFORM=xcb)
+- `/tmp/w65-root.png` (on popos) and `/tmp/w65-root.png` (on mac via scp) — screenshot of working watch face
+- Updated bug report at `docs/samsung-bug-report-draft.md` with tightened bracket
+

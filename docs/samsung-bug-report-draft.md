@@ -40,16 +40,23 @@ The guest VM is still reachable via `sdb`; install, AUL launch, Dart VM Service 
 
 ## Cross-version A/B (key evidence)
 
-Same Pop!_OS host, same KVM, same Qt5 platform, all binaries running concurrently or in sequence:
+Same Pop!_OS host, same KVM, same Qt5 platform, all binaries probed in sequence:
 
-| Emulator package | Branch | Version | Build date | Window opens? | `vigs_offscreen_server_create`? |
-|---|---|---|---|---|---|
-| `MOBILE-6.0-Emulator` | Samsung TV ext | **2.8.0.33** | 2020-09-23 | ✅ | ✅ |
-| `TIZEN-8.0-Emulator` | upstream Tizen | 5.0.3.2 | 2023-06-07 | ✅ | ✅ |
-| `TIZEN-10.0-Emulator` | upstream Tizen | 5.0.3.6 | 2025-09-11 | ✅ | ✅ |
-| `TV-SAMSUNG-Public-Emulator 10.0.0` | Samsung TV ext | **2.8.0.38** | 2025-11-20 | **❌** | **❌** |
+| Emulator package | Branch | Version | Build date | Stripped? | Window? | `vigs_offscreen_server_create`? |
+|---|---|---|---|---|---|---|
+| `MOBILE-6.0-Emulator` | Samsung-fork | **2.8.0.33** | 2020-09-23 | debug_info | ✅ | ✅ |
+| `WEARABLE-6.5-Emulator` | Samsung-fork | **2.8.0.36** | **2021-09-09** | debug_info | **✅** (renders full watch face) | ✅ |
+| `WEARABLE-7.0-Emulator` | upstream | 5.0.2.2 | 2022-09-28 | ? | (not visually verified) | ? |
+| `TIZEN-8.0-Emulator` | upstream | 5.0.3.2 | 2023-06-07 | ? | ✅ | ✅ |
+| `TIZEN-9.0-Emulator` | upstream | 5.0.3.3 | 2024-02-01 | ? | (not visually verified) | ? |
+| `TIZEN-10.0-Emulator` | upstream | 5.0.3.6 | 2025-09-11 | ? | ✅ | ✅ |
+| **`TV-SAMSUNG-Public-Emulator 10.0.0`** | **Samsung-fork** | **2.8.0.38** | **2025-11-20** | **stripped** | **❌** | **❌** |
 
-The regression is bracketed to **Samsung TV-extension branch between 2.8.0.33 and 2.8.0.38**. The parallel upstream Tizen 5.0.3.x branch (built only two months earlier in September 2025) works fine on the exact same machine. We are unable to test intermediate 2.8.0.34–37 builds because package-manager-cli only ships the latest revision.
+The regression is bracketed inside Samsung's own fork (`2.8.0.x`) **between 2.8.0.36 and 2.8.0.38** — at most one or two intermediate builds. The 2.8.0.36 binary from `WEARABLE-6.5-Emulator` renders the full watch face GUI (including animated dial and bezel artwork) on the identical Pop!_OS host. The 2.8.0.38 binary from `TV-SAMSUNG-Public-Emulator 10.0.0` does not create a window at all.
+
+Additionally, Samsung's parallel **upstream Tizen branch** (`5.0.3.x`, maintained by the same team — see Maintainer field — and building two months earlier in September 2025) works fine on the exact same machine. The bug is **not** in the host environment.
+
+Note also that **the broken binary is stripped while the working older binaries (2.8.0.33 and 2.8.0.36) ship with `debug_info` intact**. This is unusual for a regression: stripping is the only build-process change visible externally between working .36 and broken .38. We did not investigate whether the stripping itself triggers the regression (e.g. through linker option side effects), but it is worth Samsung verifying.
 
 ## Secondary observation (worth investigating but not the primary report)
 

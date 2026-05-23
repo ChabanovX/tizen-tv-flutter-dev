@@ -2357,3 +2357,47 @@ Skin and remote are visible. The remaining work to see UI is fixing guest EGL �
 - `/tmp/tv10-xvfb-final.png`, `/tmp/tv10-booted.png` (mac side) — screenshots of the Samsung TV skin + remote on Xvfb
 - `/tmp/gdb_tv10_probe.cmds`, `/tmp/gdbwrap_bin/gdb` — gdb wrapper + commands used for the DWARF probe
 
+---
+
+## Iteration 15 — Guest VM service masking + sdb wall
+
+Attempted to deploy hello_tizen_tv on TV-Samsung-10 emulator running on Xvfb. Multiple compound walls inside the guest VM:
+
+1. **AVE service (`avocd-launcher.service`)** spammed `drmWaitVBlank failed ret: -1, 22:Invalid argument` at ~80 logs/sec, pegging emulator at 130% CPU and saturating virtio-net so sdb shell hung. **Workaround**: via `qemu-nbd` mount of qcow2, masked the service (symlink `/etc/systemd/system/avocd-launcher.service` → `/dev/null`) and replaced `/usr/bin/avocd` with `/bin/true`. Also masked `aaa_tvs_deamon.service`, `tvs_deamon.service`, `tvs_lite.service`, `org.tizen.aitech_daemon_service.service`. Stopped AVE/AVOC/TVS_API/AITECH spam.
+
+2. **WRT (web runtime) / CSFS apps still restart-loop crash** with the same `evas-wayland_egl ... eglGetDisplay() fail. code=0` because guest EGL/YAGL/libdrm_vigs returns NULL from `eglGetDisplay()`. The launchpad respawns them every ~50ms. New klog spam source: `E/EFL`, `E/LAUNCHPAD`, `E/BXT_CACHE`, `E/CAPI_APPFW`. Smaller volume but still maxes virtio-net.
+
+3. **sdb shell from host hangs** at `~/tizen-studio/tools/sdb -s emulator-26101 shell ...` — every command returns "closed" or empty after 10–60s. sdb push works only to `/home/owner/share/tmp/sdk_tools/` (allowed via SMACK policy for SDK tools). `sdb root on` → `Permission denied`. `tizen install` → `There is no emulator-26101 target`. This blocks the standard install path. Caused by combination of (a) high guest-side load from app-restart cycles even with masks, (b) SMACK policy denying root mode and most paths, (c) possibly stale sdb server state.
+
+4. **Root cause hierarchy of "no visible Flutter UI"** is now layered:
+   - Layer 1 (resolved): TV-Samsung-10 emulator binary doesn't open window on Cosmic — **fixed by using Xvfb**.
+   - Layer 2 (broken): guest Wayland-EGL stack returns NULL from eglGetDisplay. Affects ALL apps that render via EFL/DALi/Flutter (which all use ecore_wl2 + wayland_egl path).
+   - Layer 3 (broken): app respawn cycles caused by Layer 2 crashes overload guest sdb daemon.
+
+### What's achievable today (with current state)
+
+- ✅ Build hello_tizen_tv TPK with proper x64 native libs (`flutter-tizen build tpk --target-arch=x64 --device-profile=tv`)
+- ✅ TV emulator window opens visibly on Xvfb (Samsung TV bezel + remote)
+- ✅ sdb push works to `/home/owner/share/tmp/sdk_tools/` (SMACK-allowed)
+- ✅ Boot completes
+- ❌ sdb shell unreliable → can't reliably run `pkgcmd -i` or `app_launcher`
+- ❌ Even if app launches, would hit same `eglGetDisplay fail` as Samsung's own pre-installed apps
+- ❌ Visible Flutter UI on Linux blocked
+
+### Realistic remaining paths
+
+1. **Real Samsung TV hardware** — the EGL stack on hardware is different (real DRM driver, real Mali GL). All this guest VM EGL grief disappears. Headless pipeline deploys directly.
+
+2. **Fix guest EGL (deep RE, days)** — patch libdrm_vigs or YAGL to make `eglGetDisplay()` succeed. Need to study the VIGS DRM protocol vs guest expectation. Possibly the Samsung internal CI uses a Mesa-virgl based VIGS backend that exposes correct DRM caps, while host's Mesa llvmpipe doesn't (we saw `libGL error: failed to load driver: nouveau` early; in fact VIGS-gl ends up on llvmpipe). If we can build Mesa with virgl support on the host and switch from `-device vigs,backend=gl` to a different backend that uses virtio-gpu, guest's EGL might work.
+
+3. **Patch libflutter_tizen.so to use software rendering** — current binary directly calls `ecore_wl2` and dmabuf, no software fallback. Would require either replacing with custom build or reverse-engineering and patching the EGL setup. Multi-day.
+
+4. **Accept and stop** — bug report is the deliverable, headless dev pipeline is the deliverable. Visual UI requires hardware.
+
+### Artifacts (iter15 additions)
+
+- `~/tizen-studio-data/emulator/vms/hello_tv/emulimg-hello_tv.x86_64` — restored from `.golden` after experimentation
+- Masks applied during iter15 (`/etc/systemd/system/{avocd-launcher,aaa_tvs_deamon,tvs_deamon,tvs_lite,org.tizen.aitech_daemon_service}.service → /dev/null`) — currently REVERTED via golden restore
+- `/tmp/tv10-xvfb-final.png`, `/tmp/tv10-clean.png`, `/tmp/tv10-final.png` — host-side screenshots
+- All previous artifacts preserved
+

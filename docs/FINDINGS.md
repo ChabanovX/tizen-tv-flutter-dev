@@ -2401,3 +2401,76 @@ Attempted to deploy hello_tizen_tv on TV-Samsung-10 emulator running on Xvfb. Mu
 - `/tmp/tv10-xvfb-final.png`, `/tmp/tv10-clean.png`, `/tmp/tv10-final.png` — host-side screenshots
 - All previous artifacts preserved
 
+---
+
+## Iteration 16 — Offline install via qcow2-mount → app launched but no visible render
+
+Since sdb shell was unreliable, used qemu-nbd mount to inject the TPK directly into guest filesystem and add a systemd oneshot service that runs `pkgcmd -i` + `app_launcher` at boot.
+
+### Setup
+
+1. Stopped emulator. `qemu-nbd -c /dev/nbd0 emulimg-hello_tv.x86_64`. Mounted `/dev/nbd0p1` → `/tmp/tv10mnt` (root partition `/`) and `/dev/nbd0p2` → `/tmp/tv10opt` (`/opt`).
+2. Copied `hello_tizen_tv-1.0.0.tpk` to `/tmp/tv10opt/home/owner/share/tmp/sdk_tools/h.tpk` (Tizen's home is at `/opt/home/owner/`).
+3. Wrote `/tmp/tv10mnt/etc/systemd/system/hello-flutter.service` with:
+   ```
+   ExecStartPre=/bin/sleep 30
+   ExecStart=/bin/sh -c "pkgcmd -i -t tpk -p /home/owner/share/tmp/sdk_tools/h.tpk > /tmp/install.log 2>&1"
+   ExecStartPost=/bin/sleep 5
+   ExecStartPost=/bin/sh -c "app_launcher --start com.example.hello_tizen_tv > /tmp/launch.log 2>&1"
+   ```
+4. Enabled via `multi-user.target.wants/hello-flutter.service` symlink.
+5. Unmounted, restarted emulator on Xvfb.
+
+### Result — confirmed install + launch in klog
+
+```
+77.563 E/PU: PreviewUpdater: PackageUpdateEvent > com.example.hello_tizen_tv install completed
+82.655 E/WasClient: CheckIsRecentlyOrMostUsedApp > [com.example.hello_tizen_tv] is recently used app
+82.657 E/AMD_APP_STATUS_TV: __pause_multi_user_target > by com.example.hello_tizen_tv
+82.662 E/AMD_APP_STATUS_TV: __on_app_fg_launch > start timer for com.example.hello_tizen_tv(0)
+91.114 E/AOT_MANAGER_SERVER: aot > AOT failed to create ni under pkg root [com.example.hello_tizen_tv]
+108.006 E/AMD_APP_STATUS_TV: __fg_launch_timeout > com.example.hello_tizen_tv(0)
+108.007 E/AMD_APP_STATUS_TV: __resume_multi_user_target > by com.example.hello_tizen_tv
+```
+
+The Application Manager Daemon (AMD) registered the app, started a foreground launch timer, and the timer **timed out at 108s** because the app never created a visible foreground window. The same `eglGetDisplay() fail. code=0` happens for our Flutter app as for every other DALi/EFL/WRT app in this guest.
+
+### What this means
+
+Visible Flutter UI in TV-Samsung-10 emulator on Linux is **gated by guest EGL initialization**. Until that is fixed, no app (including Samsung's own pre-installed homescreen, taskbar, volume, csfs, wrt-loader) renders a visible window.
+
+### Confirmed working chain (so far)
+
+| Step | Status |
+|---|---|
+| flutter-tizen build TPK with x64 native libs | ✅ |
+| Sign with Samsung certs (vld profile) | ✅ |
+| TV-Samsung-10 emulator binary opens window on Xvfb (Samsung TV skin + remote visible) | ✅ |
+| Guest VM boots to "boot completed!" | ✅ |
+| Offline TPK install via systemd oneshot service | ✅ |
+| AUL launch — process spawned, dotnet-launcher activated | ✅ |
+| AMD foreground launch timer started | ✅ |
+| **App creates visible window in emulator inner canvas** | ❌ (gated by guest EGL) |
+
+### Final wall — guest YAGL/EGL
+
+`/usr/lib64/driver/libEGL.so.1.0` (Samsung's YAGL — Yet Another GL — implementation that talks to VIGS DRM device) returns NULL from `eglGetDisplay(EGL_DEFAULT_DISPLAY)`. The reason is internal to YAGL. To fix:
+
+- Need strace inside guest to see which IOCTL on `/dev/dri/card0` fails (sdb shell broken, would need LD_PRELOAD trace lib or kernel tracepoints)
+- OR replace `/usr/lib64/driver/libEGL.so.1.0` (YAGL) with Mesa-EGL with software (swrast) backend — cross-compile Mesa for guest, days of work
+- OR patch libflutter_tizen.so to skip EGL and use software Skia + Wayland-SHM — multi-day binary RE
+- OR get real Samsung TV hardware where YAGL is replaced by real Mali GL driver
+
+### Practical answer to "where can we get visible Flutter UI"
+
+1. **Real Samsung TV** ($150-500, 1 week shipping). Headless dev pipeline ships to it unchanged.
+2. **Mesa-virgl backend for VIGS** (multi-day). Cross-compile mesa-virgl, install in guest, switch from VIGS-GL to virtio-gpu. Speculative.
+3. **Wait for Samsung to fix the emulator stack** (file SDK bug, wait months).
+
+### Artifacts (iter16)
+
+- `/tmp/tv10mnt`, `/tmp/tv10opt` — mount points (used during qcow2 manipulation)
+- `~/tizen-studio-data/emulator/vms/hello_tv/emulimg-hello_tv.x86_64` — overlay with installed hello_tizen_tv app
+- App is now pre-installed in the guest image; subsequent boots auto-launch via hello-flutter.service
+- Klog confirmation of install + launch at host-side `~/tizen-studio-data/emulator/vms/hello_tv/logs/emulator.klog`
+

@@ -2187,6 +2187,25 @@ Same Pop!_OS host, same KVM, same Xvfb :99 X server, same `QT_QPA_PLATFORM=xcb`,
 - Xvfb daemon: `Xvfb :99 -screen 0 4096x1200x24 -ac` (running headless)
 - Screenshot: visible mobile emulator skin in upper-left of 4096x1200 Xvfb framebuffer (mac-side path `/tmp/mobile60-root.png` for archive)
 
+### Iter12 deep dive — Tizen 10 public deployment attempt (2026-05-23)
+
+After confirming the regression in 2.8.0.38, we attempted to deploy hello_tizen_tv on the Tizen 10 public emulator (works visually as shown in iter12). Result: hit multiple compound walls in succession.
+
+**Wall 1 — buxton naming**: dlog errors said "Can't connect to buxton" which we initially misread as service down. Actually the service is `buxton2.service` (not `buxton.service`) — it WAS running. We were grepping the wrong name. Once disk had free space (cleared `/opt/usr/share/crash`), buxton2 reads work from root context. App-context buxton access is gated by SMACK labels but apps successfully launch through launchpad regardless.
+
+**Wall 2 — flutter-tizen ARM/x64 build bug**: First TPK we built shipped a 32-bit ARM `libflutter_tizen.so` for our x86_64 emulator. flutter-tizen's `build tpk` defaults to wrong architecture. Diagnosed via `file libflutter_tizen.so` on the pulled lib. Workaround: explicit `flutter-tizen build tpk --release --target-arch=x64 --device-profile=common`. TPK grew from 7.6MB → 14.5MB with proper x64 native libs.
+
+**Wall 3 — disk full again**: New TPK + `/opt 3GB partition` fills again after install. `rm -rf /opt/usr/share/crash/*` between attempts solves it.
+
+**Wall 4 — GLES/EGL initialization in apps**: With backend=gl in vm_launch.conf and Mesa llvmpipe on host providing software OpenGL 4.5, VIGS device init succeeds (`vigs_gl_backend: Using OpenGL 3.1+ core`, `GL_RENDERER = llvmpipe`). Compositor uses GL for wallpaper (visible blue gradient). But all DALi-based apps fail with:
+   - `tizen_renderer_egl.cc: PrintEGLError(339) > Unknown EGL error: 0`
+   - `tizen_renderer_egl.cc: CreateSurface(62) > Could not get EGL display.`
+   - `window-impl.cpp: SetScreen(1755) > input Screen name is empty`
+   - `OpenGL ES is not supported`
+   - `terminate called after throwing an instance of 'Dali::DaliException'`
+
+Crucially, this hits **Samsung's pre-installed apps too**: `org.tizen.homescreen`, `boot-animation-dali`, `org.tizen.volume`, `TaskBar.dll` all crash with the same DALi GLES error. So the Tizen 10 public emulator build (tizen-unified_20251027.095554) is itself broken — its own apps don't work. This is not a our-app-specific issue.
+
 ### Iter12 follow-up — Tizen 10 public + Tizen 8 app deploy attempts
 
 Confirmed cross-version data by also installing TIZEN-8.0-Emulator and TIZEN-9.0-Emulator and testing the 10.0 public emulator already present:

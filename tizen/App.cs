@@ -1,51 +1,44 @@
 using System;
-using Tizen.Flutter.Embedding;
+using Tizen.NUI;
 
 namespace Runner
 {
-    public class App : FlutterApplication
+    public class App : NUIApplication
     {
         protected override void OnCreate()
         {
-            Tizen.Log.Error("ConsoleMessage", "PHASE3_TRACE: App.OnCreate entered");
-            try
-            {
-                base.OnCreate();
-                Tizen.Log.Error("ConsoleMessage", "PHASE3_TRACE: App.OnCreate after base.OnCreate");
-            }
-            catch (Exception ex)
-            {
-                Tizen.Log.Error("ConsoleMessage", $"PHASE3_TRACE: App.OnCreate base threw: {ex}");
-                throw;
-            }
+            Console.Error.WriteLine("PHASE3_STDERR: MinimalNUIApp.OnCreate ENTERED");
+            Tizen.Log.Error("ConsoleMessage", "PHASE3_TRACE: MinimalNUIApp.OnCreate ENTERED");
+            base.OnCreate();
+            Console.Error.WriteLine("PHASE3_STDERR: MinimalNUIApp.OnCreate after base");
+            Tizen.Log.Error("ConsoleMessage", "PHASE3_TRACE: MinimalNUIApp.OnCreate after base");
+        }
 
-            try
-            {
-                GeneratedPluginRegistrant.RegisterPlugins(this);
-                Tizen.Log.Error("ConsoleMessage", "PHASE3_TRACE: App.OnCreate plugins registered");
-            }
-            catch (Exception ex)
-            {
-                Tizen.Log.Error("ConsoleMessage", $"PHASE3_TRACE: App.OnCreate RegisterPlugins threw: {ex}");
-                throw;
-            }
+        protected override void OnPause()
+        {
+            Console.Error.WriteLine("PHASE3_STDERR: MinimalNUIApp.OnPause");
+            base.OnPause();
+        }
+
+        protected override void OnResume()
+        {
+            Console.Error.WriteLine("PHASE3_STDERR: MinimalNUIApp.OnResume");
+            base.OnResume();
+        }
+
+        protected override void OnTerminate()
+        {
+            Console.Error.WriteLine("PHASE3_STDERR: MinimalNUIApp.OnTerminate");
+            base.OnTerminate();
         }
 
         static void Main(string[] args)
         {
-            Tizen.Log.Error("ConsoleMessage", $"PHASE3_TRACE: Main entered argc={args?.Length ?? 0}");
-            try
-            {
-                var app = new App();
-                Tizen.Log.Error("ConsoleMessage", "PHASE3_TRACE: Main after new App, calling Run");
-                app.Run(args);
-                Tizen.Log.Error("ConsoleMessage", "PHASE3_TRACE: Main after app.Run returned");
-            }
-            catch (Exception ex)
-            {
-                Tizen.Log.Error("ConsoleMessage", $"PHASE3_TRACE: Main caught: {ex}");
-                throw;
-            }
+            Console.Error.WriteLine("PHASE3_STDERR: MinimalNUIApp.Main entered");
+            var app = new App();
+            Console.Error.WriteLine("PHASE3_STDERR: MinimalNUIApp.Main calling Run");
+            app.Run(args);
+            Console.Error.WriteLine("PHASE3_STDERR: MinimalNUIApp.Main Run returned");
         }
     }
 }

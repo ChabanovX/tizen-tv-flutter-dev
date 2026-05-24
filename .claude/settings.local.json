@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/chabanovz/tizen-kernel-build/src/usr/**)",
+      "Bash(mkdir -p /tmp/tizen-initramfs)",
+      "Read(//tmp/**)",
+      "Bash(rm -rf *)",
+      "Bash(zcat ~/tizen-kernel-build/src/usr/initramfs_data.cpio.gz)",
+      "Bash(xxd)",
+      "Bash(cpio -idmv)"
+    ]
+  }
+}

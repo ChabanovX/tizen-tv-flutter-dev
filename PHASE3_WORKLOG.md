@@ -447,6 +447,70 @@ Other apps that successfully called `ecore_wl2_window_show` in same boot: PID 15
 - This requires re-writing `App.cs` to inherit from `NUIApplication`, instantiate `NUIFlutterView`, and bridge the Flutter engine to a NUI window.
 - Alternatively: patch libapp-core-ui-cpp or libecore_wl2 to skip the compositor-ack wait and self-fire CREATE after a timeout. Larger blast radius.
 
+### Iter 16-17 — Path A (NUIApplication + NUIFlutterView, then MinimalNUIApp): SAME blocker
+
+**Approach**:
+1. Patched `tizen/Runner.csproj` `tizen80 → tizen90` (NUIFlutterView requires NativeImageQueue / FocusableInTouch API 9+).
+2. Patched `~/dev/flutter-tizen/embedding/csharp/Tizen.Flutter.Embedding/Tizen.Flutter.Embedding.csproj` to keep NUIFlutterView.cs compiled for tizen90 (was excluded for tizen40+tizen80 only).
+3. Rewrote `tizen/App.cs` to inherit `Tizen.NUI.NUIApplication`, build `NUIFlutterView`, call `_flutterView.RunEngine()` in OnCreate.
+4. Added Tizen.Log + Console.Error.WriteLine PHASE3_TRACE at every lifecycle entry/exit.
+5. Added manifest tuning: `splash-screen-display="true"`, `launch_mode="single"`, `<metadata key="http://samsung.com/tv/metadata/built-in-app" value="true"/>` (matching every working dotnet-inhouse system app).
+6. Build TPK, modify manifest to `dotnet-inhouse`, re-sign with `vld` profile, deploy to qcow2.
+
+**Iter 16 — NUIFlutterView path**:
+Observed klog (PID 3597 for one boot, PID 3655 for another):
+```
+122.301 APP_CORE app_core_rotation Init [INSIDE base.Run]
+[SILENCE for 280+s — no NUI.OnCreate, no PHASE3_TRACE, no klog activity for our PID]
+```
+- Console.Error.WriteLine ("PHASE3_STDERR: NUIApp.Main entered" / "Main calling Run") DID appear → confirms .NET Main ran.
+- `Tizen.Log.Error("ConsoleMessage", ...)` calls did NOT appear in klog. dlog lib seemingly disabled or filtered for our process before base.Run native init completes.
+- Same as FlutterApplication: OnCreate never fires.
+
+**Iter 16 — MAPS at iter=30 confirmed huge framework load**:
+- libdali2-adaptor-application-normal.so ✓
+- libdali2-adaptor/core/csharp-binder/toolkit ✓
+- libecore_wl2, libwayland-client/cursor/egl/egl-tizen/server/tbm-client ✓
+- libtizen-core, libtizen-extension-client, libtizen-launch-client, libtizen-policy-ext-client ✓
+- libfontconfig, libfreetype, libharfbuzz, libfribidi, libpixman, libthorvg, libpng, libjpeg, libwebp ✓
+- libtbm, libdrm ✓
+- ecore_wl2/engines/dmabuf/v-1.25/module.so ✓
+- **NO libflutter_*, NO libEGL, NO libGL**
+- `Runner.dll` mapped, `Tizen.Flutter.Embedding.dll` NOT mapped (since MinimalNUIApp doesn't reference any embedding classes)
+
+**Iter 16 — STACK at iter=30**:
+```
+poll_schedule_timeout
+do_sys_poll
+SyS_poll
+entry_SYSCALL_64_fastpath
+```
+All 11 threads idle. Main in poll, .NET threads in poll/futex/pipe_wait, no work happening.
+
+**Iter 16 strace 30s — ONLY `restart_syscall(<... resuming interrupted poll ...>)`**, no other syscall in 30 seconds.
+
+**Iter 17 — strace attached AT app start, 40 seconds runtime**:
+Captured: 12 threads, all of them either in:
+- poll/restart_syscall (main + GC/finalizer)
+- futex_wait_queue with ETIMEDOUT every 10-15 seconds (CLR Finalizer GC idle)
+- read(34), read(36), read(76) — pipe reads for StdOut/StdErr redirect threads
+- Some threads exit cleanly (madvise + exit(0)) — GC trimming worker count
+
+**NO wayland I/O. NO compositor calls. NO window creation attempts.**
+
+**Comparison with working CSFS** (also NUIApplication):
+- 7.957s: E20_SCREEN_CONTROLLER pillarbox_controller logs `win:0x02356520, name:/opt/usr/apps/com.samsung.tv.csfs/bin/csfs.dll` — CSFS's window appears in compositor's stack
+- 9.658s: CSFS logs OnCreate START
+
+For our app: E20_SCREEN_CONTROLLER NEVER logs our window. Our app never registers a window with enlightenment.
+
+**Conclusion — Path A FAILED with concrete evidence**:
+- Both `FlutterApplication` (CoreUIApplication/elementary) AND `NUIApplication` (DALI) AND `MinimalNUIApp` (no Flutter, no NUIFlutterView, just NUIApplication.OnCreate) all stuck at the same point: `base.Run()` enters appcore main loop, app_core_rotation Init fires (inside base.Run native init), then SILENT — no OnCreate hook fires.
+- The blocker is NOT specific to elementary or to Flutter or to NUIFlutterView. It's a TIZEN PLATFORM level issue affecting ALL .NET UI apps that we install ourselves and launch via app_launcher.
+- CSFS works because it's a pre-installed Samsung system app with platform certs. The pre-fork worker pool launches CSFS via different path than `app_launcher --start`.
+
+
+
 
 
 

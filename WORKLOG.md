@@ -163,3 +163,91 @@ Real fix paths (multi-day work, beyond autonomous session scope):
 **After**: enlightenment MAIN LOOP AT LAST. EE_SOFTWARE_TBM 3840x1080 canvas allocated. wm_ready created by compositor. Multiple wayland clients connect+commit surfaces. Inner TV canvas pure BLACK (compositor scanout bound to VIGS, draws empty background). Apps that don't use Mesa EGL would render.
 
 **Distance to user goal (visible Flutter UI)**: Closer but not yet — Flutter Tizen embedder hard-requires working Mesa wayland EGL which fails due to wl_drm protocol issue. Requires one of the multi-day fixes above.
+
+### Step 9 — Resume autonomous iteration: capture exact app crash backtrace ✅
+
+User pushed back on stop decision — correct call. Capturing exact crash bt revealed wider attack surface.
+
+**LD_PRELOAD shim** built (`~/abort_shim/libabort_shim*.so` on popos) intercepts SIGABRT/SIGSEGV → writes backtrace via `backtrace_symbols_fd` to `/opt/usr/share/crash/dump/flutter_bt.txt`. Installed via `/etc/ld.so.preload` (Tizen launchpad strips ordinary LD_PRELOAD env but `/etc/ld.so.preload` is system-level and survives execve).
+
+**dotnet sigaction patches**:
+- `libdotnet_plugin.so` file offset `0x138b0`: `0x55` → `0xc3` (registerSignalHandler → immediate ret)
+- `libdotnet_launcher_core.so` file offset `0x5d91`: `e8 3a e6 ff ff` (call sigaction@plt) → `b8 00 00 00 00` (mov eax,0) — skips installing onSigabrt handler that suppressed kernel core dumps
+
+**enable-cores.service** + `DefaultLimitCORE=infinity:infinity` in `/etc/systemd/system.conf.d/core-dumps.conf` — system-wide core dump enabling.
+
+After these, kernel core dumps captured. gdb on launchpad-loader and volume-app cores both pinpointed:
+```
+#0  __pthread_kill_implementation       (SIGABRT)
+#1  raise
+#2  abort
+#3  wl_abort                            (libwayland-client.so.0)
+#4  wl_proxy_wrapper_destroy            ← crash point
+#5  dri2_teardown_wayland               (Mesa libEGL)
+#6  dri2_display_destroy
+#7  dri2_initialize
+#8  eglInitialize
+#9  eng_window_new                      (evas wayland_egl module)
+...
+#21 elm_win_add                         (libelementary)
+#22 LaunchpadLoader::InitializeWindow
+```
+
+Root cause: our earlier patches made `wl_proxy_create_wrapper(p) → p` (no actual wrapping). When Mesa fails eglInitialize and calls `dri2_teardown_wayland` cleanup, it invokes `wl_proxy_wrapper_destroy(p)` on the original proxy. libwayland validates → not a wrapper → `wl_abort()`.
+
+### Step 10 — Patch wl_proxy_wrapper_destroy@plt ✅
+
+Mesa libEGL.so.1.0 file offset `0xf890` (wl_proxy_wrapper_destroy@plt): `f3 0f 1e fa ff 25 26 8d 05 00 66 0f 1f 44 00 00` → `c3 90 90 ...` (ret + 15 NOPs). Function returns void → safe to no-op.
+
+After patch + boot: launchpad-loader and other apps no longer wl_abort. **TRANSIENT CLOCK WIDGET appeared briefly** in TV canvas during one boot — first non-system pixel content. Brief screenshot captured at `/tmp/tv10-wpd-patched.png` shows analog clock face in upper-left area.
+
+### Step 11 — Flutter still doesn't render but no SIGABRT/SIGSEGV either
+
+Currently:
+- Flutter app installs ✓ ("install completed" at ~78s)
+- fg_launch starts ✓ (84s)
+- AOT fails (expected — JIT fallback)
+- fg_launch_timeout at 110s ✗ (no foreground window appeared)
+- NO `onSigabrt called`
+- NO process exit with status(6) for hello_tizen_tv
+- NO core dump for hello_tizen_tv
+
+Failure mode shifted: app process running but unable to attach surface to compositor. Possibly stuck inside Flutter engine init waiting for something, OR running fine but not committing visible content.
+
+Many other Tizen apps DO crash (status 11 SIGSEGV) — Chrome_InProcGp, RenderThread, dotnet-launcher pre-fork instances. These produce ~900MB cores filling disk space rapidly.
+
+### Comprehensive patch list (final session state)
+
+```
+File: /usr/lib64/driver/libEGL.so.1.0 (Mesa 26.2.0-devel cross-built)
+  offset 0xf680: wl_proxy_create_wrapper@plt → mov rax,rdi; ret; nops (returns input)
+  offset 0xf080: wl_proxy_set_queue@plt      → ret; nops (void no-op)
+  offset 0xf890: wl_proxy_wrapper_destroy@plt → ret; nops (void no-op)
+
+File: /usr/bin/enlightenment
+  offset 0x4877e: NOPed je 0x449ed9 → forces software_tbm path
+
+File: /usr/lib64/libdotnet_plugin.so
+  offset 0x138b0: 0x55 → 0xc3 (registerSignalHandler → ret)
+
+File: /usr/lib64/libdotnet_launcher_core.so
+  offset 0x5d91: e8 3a e6 ff ff → b8 00 00 00 00 (sigaction call → mov eax,0)
+
+File: /usr/lib64/libflutter_tizen.so (via /opt/usr/dotnet/Libraries/libflutter_tizen.so..*)
+  offset 0x51c87: 8 bytes NOPed (test+je) — ignore EGL fail return
+
+File: /etc/ld.so.preload → /usr/lib64/libabort_shim.so
+File: /etc/systemd/system.conf.d/mesa-env.conf — LIBGL_DRIVERS_PATH, MESA_LOADER_DRIVER_OVERRIDE=softpipe, USE_EVAS_SOFTWARE_TBM_ENGINE=1
+File: /etc/systemd/system.conf.d/core-dumps.conf — DefaultLimitCORE=infinity
+File: /etc/systemd/system/enable-cores.service — sets core_pattern, fs.suid_dumpable=2
+File: /etc/profile.d/zz-mesa.sh — same env exports for shell-launched processes
+File: /usr/bin/run_enlightenment.sh — added crash dump capture + watchdog
+```
+
+### Next-iteration plan
+
+The Flutter app no longer crashes audibly but produces no surface. Options:
+1. **Strace hello_tizen_tv process** to see what syscalls are made between fg_launch and timeout — would identify stuck point
+2. **Modify libflutter_tizen.so to use software renderer** (skip OpenGL path entirely) — substantial binary surgery
+3. **LD_PRELOAD shim that wraps EGL functions** to provide mock display/context that "succeeds" but routes to no-op — would let Flutter proceed to commit phase, may produce visible content
+4. **Pull live core via gcore equivalent** while Flutter process is alive (using running emulator state)

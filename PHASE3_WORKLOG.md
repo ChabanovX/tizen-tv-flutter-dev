@@ -164,3 +164,39 @@ H7 (appcore event delivery): partial. Now appcore likely fired Created but app d
 
 Next: capture probe data while inhouse-Flutter is alive AND identify why it exits status 0 (clean) — likely Tizen.Flutter.Embedding's OnCreate runs but Application.Run returns immediately.
 
+### Iter 5 — Inhouse-launched Flutter exits clean status(0) in ~130ms
+
+Full klog timeline of one inhouse launch (PID 3620):
+
+```
+118.605: AMD CUSTOM_COMMAND:205 dispatch_cb fail
+118.626: LAUNCHPAD Execute /usr/bin/dotnet-launcher-inhouse (PID 3620)
+118.643: dotnet-launcher GetCoBADirFromCache
+118.648: dotnet-launcher GetTPARO + GetTPAFromCache
+118.719: dotnet-launcher handleDebugPipe ×2 (still "Fail to setxattr" but proceeds)
+118.727: dotnet-launcher checkAppHasPlatformPrivilege
+118.770: AMD amd_api recv_ret(-104) ECONNRESET on fd 89 to PID 3620
+118.771: SIGCHLD pid=3620 status(0)
+```
+
+Total lifetime: 145ms. Process exited cleanly (status 0).
+
+PID 3620 reached `checkAppHasPlatformPrivilege` then 43ms later, AMD's client channel got ECONNRESET (peer closed connection). PID exited cleanly.
+
+There's an interesting AMD log at 118.604: `app_group.c: _app_group_get_id(252) > Failed to find app status. pid(3910)`. PID 3910 ≠ 3620. Possible the pool worker pre-allocated a different child PID, but launchpad ended up using 3620 for the inhouse pool entry.
+
+Process exits CLEANLY without crashing. Either:
+- Application.Run() returns immediately (no main loop entered)
+- Pool worker forks then parent exits, child becomes user app under different PID — but no other hello_tizen_tv process visible
+
+Probe4 with 0.5s sampling for 60s did NOT find any hello_tizen_tv process at all — confirms the app's effective lifetime is <500ms.
+
+Tizen system dotnet apps (CSFS, channel-list, pillarbox) use exact same launchpad path (dotnet-launcher-inhouse) and successfully enter main loop. So inhouse pool path itself works.
+
+**Hypothesis H8**: Tizen.Flutter.Embedding's FlutterApplication.OnCreate (or earlier) throws unhandled exception that .NET catches, causing Application.Run to return immediately. Possible causes:
+- Missing dependency (Tizen.NUI not loaded)
+- Cmdline arg parse failure
+- Required permissions not granted (checkAppHasPlatformPrivilege already ran though)
+
+Next: capture stderr/stdout of inhouse-launched Flutter process before its quick exit. Either via patched libdotnet_plugin's stdErrRedirect, or by attaching strace to dotnet-launcher-inhouse pool worker.
+

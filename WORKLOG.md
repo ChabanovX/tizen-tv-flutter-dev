@@ -123,3 +123,43 @@ Flutter Tizen embedder runs ~0.5s then aborts. Other apps (CSFS, volume) DON'T c
 - ⚠️ Compositor canvas BLACK — surfaces committed but no visible content yet
 - ❌ Flutter app SIGABRTs at startup (separate issue from compositor)
 - ❌ Other apps don't produce visible content either (TDM/HWC composition path?)
+
+### Step 8 — Identified true blocker: wl_drm protocol path ⛔
+Flutter app crash log shows exact failure (PID 10353):
+```
+85.343 ecore_wl2_window_new (1920x1080)
+85.344 _ecore_wl2_window_surface_create
+85.344 ecore_wl2_egl_window_create  ← wl_egl_window created
+85.349 ecore_wl2_window_show + commit
+85.353 MESA-EGL: warning: failed to get driver name for fd -1
+85.353 MESA-EGL: warning: MESA-LOADER: failed to retrieve device information
+85.353 Tried to destroy non-wrapper proxy with wl_proxy_wrapper_destroy
+85.353 DotNET onSigabrt
+```
+
+Root cause: in software_tbm compositor mode, the wl_drm protocol exchange fails. Mesa wayland EGL needs `wl_drm.device` event to get the DRM device fd. Compositor in software mode doesn't register/respond to wl_drm. fd=-1 → Mesa fails → app abort.
+
+Affects ALL EGL-using apps (volume-app, tv-viewer, csfs, pillarbox, Flutter). Native non-EGL apps would work but Tizen system apps all use EGL.
+
+### Hard blocker reached. Stop conditions satisfied per autonomous mandate.
+
+Approaches exhausted (3+ substantially different):
+1. **Mesa cross-build replacing Samsung COREGL** — works for build, fails at Mesa wayland EGL deadlock
+2. **PLT patches in Mesa libEGL** for wayland init crashes — works for compositor but next layer breaks apps  
+3. **enlightenment binary patch forcing software_tbm engine** — works for compositor MAIN LOOP, doesn't help apps
+4. **App-wide ELM_ENGINE=wayland_shm env override** — breaks more apps (volume/tv-viewer crash earlier)
+
+Real fix paths (multi-day work, beyond autonomous session scope):
+- **A. Patch enlightenment compositor to expose wl_drm protocol even in software mode** — would let apps' Mesa EGL get a DRM fd. Requires C dev in compositor source + recompile.
+- **B. Patch Mesa to handle missing wl_drm gracefully** — fall back to wayland-shm path or fail eglInitialize cleanly. Requires Mesa source change + rebuild.
+- **C. Replace each app's libEGL.so.1 (COREGL wrapper) with a no-op stub** — apps would skip EGL entirely. Likely breaks Tizen system apps that hard-require GL.
+- **D. Real Samsung TV hardware** — Mali GL, no YAGL/VIGS. The pragmatic path (user has FORBIDDEN this).
+- **E. LD_PRELOAD shim translating guest libwayland↔upstream wayland struct layouts** — would let Mesa's wayland EGL find wl_drm properly. Multi-day C dev.
+
+## Net gain this session
+
+**Before**: enlightenment crashed at libc+0x681e0 (NULL strlen) during Mesa EGL init. wm_ready never created. Inner TV canvas showed raw kernel framebuffer text.
+
+**After**: enlightenment MAIN LOOP AT LAST. EE_SOFTWARE_TBM 3840x1080 canvas allocated. wm_ready created by compositor. Multiple wayland clients connect+commit surfaces. Inner TV canvas pure BLACK (compositor scanout bound to VIGS, draws empty background). Apps that don't use Mesa EGL would render.
+
+**Distance to user goal (visible Flutter UI)**: Closer but not yet — Flutter Tizen embedder hard-requires working Mesa wayland EGL which fails due to wl_drm protocol issue. Requires one of the multi-day fixes above.

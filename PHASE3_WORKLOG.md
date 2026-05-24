@@ -594,6 +594,36 @@ Files: `/usr/share/amd/mod/libamd-mod-ui-core.so` (contains `_app_group_get_id` 
 
 The `Failed to find app status. pid(N)` log strings are exact, so byte-grep finds the check function. Next session: disassemble the failing path and patch the early-return to fall through to the normal dispatch.
 
+### Iter 21 — Naive "always return 1" patch on _app_group_get_id (FAILED, side effects)
+
+**Patch attempted** on `/usr/share/amd/mod/libamd-mod-ui-core.so` at file offset 0x86c0:
+- Replaced function entry 10 bytes (`55 48 89 e5 41 54 41 89 fc 53`) with `b8 01 00 00 00 c3 90 90 90 90` (`mov eax,1; ret; nop*4`).
+- Skips entire function body, always returns 1.
+
+**Result**:
+- AMD's `Failed to find app status. pid(...)` / `dispatch_cb fail|cmd=CUSTOM_COMMAND:205` log lines DISAPPEARED — the patch successfully made the lookup "succeed".
+- BUT: hello-flutter.service never triggered install. PHASE3_TRACE log never appears.
+- And NEW errors appeared in klog at unrelated boot stages:
+  ```
+  191.540 AMD_APP_FINDER_TV: app-finder.c: __foreach_user_dir(112): Failed to get appid. pid(3853)
+  192.225 LAUNCHPAD: launchpad.cc: OnIOEventReceived(763): Permission denied. pid(4898)
+  192.225 AUL: launch.cc: aul_launch_app_fast_without_resinfo_for_uid(1214): Failed to send request. appid: comss, error: -1
+  ```
+- Other system apps started misbehaving because `_app_group_get_id` now always returns 1, breaking AMD's app-group bookkeeping system-wide.
+
+Patch REVERTED.
+
+**Lesson**: returning 1 is too aggressive. The correct fix is to make `_app_group_get_id` fall back to look up by appid (from caller bundle / process appid) when pid lookup fails — not return a bogus sentinel. That requires reading the bundle, calling `aul_app_get_appid_bypid` or similar, and adding new code (not just a NOP patch). This is multi-instruction injection territory.
+
+**For next session**: 
+1. The smoking gun finding (iter20) is sound: AMD's pid-based lookup fails for our app.
+2. The naive patch (iter21) doesn't work because of downstream side effects.
+3. The next surgical patch should change `amd_app_status_find_by_effective_pid`'s behavior, OR add an alternative lookup-by-appid only inside `_app_group_get_id`'s `je` failure branch.
+
+### Phase 3 Session Stop — final
+
+
+
 
 
 

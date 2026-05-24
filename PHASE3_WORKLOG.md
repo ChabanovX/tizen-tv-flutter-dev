@@ -385,6 +385,70 @@ App stuck for **8+ minutes** in identical state:
 
 Approach 3 is smallest blast radius and least invasive. Tizen.Flutter.Embedding.dll is part of our TPK and can be modified in source (it's open-source flutter-tizen).
 
+### Iter 15 — Patched embedding ships, lifecycle trace PROVES OnCreate never fires
+
+**Source patch applied** to flutter-tizen embedding at `~/dev/flutter-tizen/embedding/csharp/Tizen.Flutter.Embedding/FlutterApplication.cs` and user app `tizen/App.cs`:
+- Added `TizenLog.Error("PHASE3_TRACE: ...")` at every lifecycle method entry/exit
+- Wrapped `base.OnCreate()`, `new FlutterEngine(...)`, `ApplicationNewManual4(...)`, `GetWindow`, `FlutterDesktopViewCreateFromNewWindow` in try/catch with exception logging
+- All Engine.Notify* calls null-guarded to allow logging from OnResume/OnPause even when Engine is null
+- User's `App.cs` Main() and OnCreate() also wrapped with PHASE3_TRACE logging
+
+**Build process**:
+1. `dotnet build -c Release` in flutter-tizen embedding/csharp dir → produces patched Tizen.Flutter.Embedding.dll
+2. `dotnet build -c Release -p:FlutterEmbeddingPath=<path>/Tizen.Flutter.Embedding.csproj` on Runner.csproj → produces full TPK
+3. On popos: extract TPK, edit manifest `type="dotnet"→"dotnet-inhouse"`, re-sign with `vld` profile (`~/tizen-studio/tools/ide/bin/tizen package -t tpk -s vld --`), deploy to qcow2 `/home/owner/share/tmp/sdk_tools/h.tpk`
+
+**Result on boot** (PID 3612, kernel time 119s):
+```
+119.593 E/LAUNCHPAD(P 3612): Execute /usr/bin/dotnet-launcher-inhouse
+119.627 E/DOTNET_LAUNCHER plugin-util.cpp: GetCoBADirFromCache
+119.635 E/DOTNET_LAUNCHER plugin-util.cpp: GetTPARO + GetTPAFromCache
+119.839 E/ConsoleMessage FlutterApplication.cs: Run(120): PHASE3_TRACE: Run() entered
+119.839 E/ConsoleMessage FlutterApplication.cs: Run(129): PHASE3_TRACE: Run() before base.Run
+119.877 E/APP_CORE app_core_rotation.cc: Init: sensord_connect() is failed
+[then SILENCE for 280+ seconds — process alive but no further log output]
+```
+
+**Observed lifecycle events (Phase 3 final)**:
+- ✓ `Main()` entered (PID 3612 created in launchpad)
+- ✓ `new App()` constructed
+- ✓ `app.Run(args)` → `FlutterApplication.Run` entered
+- ✓ `base.Run(args)` called (which transfers to native `Application.Run` → `ui_app_main` → `appcore_efl_main`)
+- ✓ `app_core_rotation` Init runs INSIDE base.Run (proves appcore-ui initialization is in progress)
+- ✗ **App.OnCreate ENTERED — NEVER FIRED**
+- ✗ FlutterApplication.OnCreate — NEVER FIRED
+- ✗ `new FlutterEngine(...)` — NEVER CALLED
+- ✗ `libflutter_tizen.so` — NEVER dlopened
+- ✗ `FlutterDesktopViewCreateFromNewWindow` — NEVER CALLED
+- ✗ OnResume — NEVER FIRED
+
+**Comparison with working dotnet system app (CSFS, PID 1516)** in same boot:
+```
+25.753 E/CSFS NUIApp.cs: OnCreate(195): NUIApp.OnCreate - START
+25.761 E/CSFS NUIApp.cs: OnCreate(198): UsePreCompiledShader Start
+25.796 E/CSFS NUIApp.cs: OnCreate(200): UsePreCompiledShader END
+47.537 E/CSFS NUIApp.cs: OnCreate(276): NUIApp.OnCreate - END
+```
+
+CSFS inherits from `NUIApplication` (not `CoreUIApplication`). NUIApplication uses DALI-based window creation. **DALI window create succeeds on software_tbm compositor; elementary window create does not.**
+
+Other apps that successfully called `ecore_wl2_window_show` in same boot: PID 1531, 1541, 1516 (CSFS — but CSFS uses NUIApp + DALI, the ecore_wl2_window_show calls there may be from precreate phase). Our PID 3612 NEVER calls `ecore_wl2_window_show`.
+
+**Precise root cause (Phase 3 stop condition)**:
+- `Tizen.Applications.CoreUIApplication.Run` calls into native `appcore_efl_main` (libapp-core-efl-cpp).
+- `appcore_efl_main` initializes ecore_evas with the wl2_shm engine, then calls `elm_win_add` to create a wayland window via libecore_wl2.
+- The wayland window create path in libecore_wl2 issues `wl_compositor.create_surface` and `tizen_policy.activate` requests to the enlightenment compositor.
+- enlightenment is running in **software_tbm mode** (per Phase 2 binary patch in `/usr/bin/enlightenment` @ 0x4877e) and does NOT properly acknowledge the create_surface / tizen_policy sequence from elementary-based clients.
+- DALI clients use a DIFFERENT wayland surface creation path (via `Dali::Application` → libdali2-adaptor) that the software_tbm compositor handles correctly.
+- Because our app's elementary window create never completes, appcore_efl never fires its `CREATE` event, which means `Tizen.Applications.CoreUIApplication.OnCreate` never fires, which means `FlutterApplication.OnCreate` never fires, which means `Engine = new FlutterEngine(...)` is never executed, which means `libflutter_tizen.so` is never dlopened.
+
+**Next direction** (for future phase):
+- Switch our app from `FlutterApplication` (inherits `CoreUIApplication`/elementary) to `NUIApplication` + `NUIFlutterView` (which uses DALI window). The embedding source already provides `NUIFlutterView.cs`.
+- This requires re-writing `App.cs` to inherit from `NUIApplication`, instantiate `NUIFlutterView`, and bridge the Flutter engine to a NUI window.
+- Alternatively: patch libapp-core-ui-cpp or libecore_wl2 to skip the compositor-ack wait and self-fire CREATE after a timeout. Larger blast radius.
+
+
+
 
 
 

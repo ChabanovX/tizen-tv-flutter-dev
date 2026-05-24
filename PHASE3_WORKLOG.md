@@ -509,6 +509,50 @@ For our app: E20_SCREEN_CONTROLLER NEVER logs our window. Our app never register
 - The blocker is NOT specific to elementary or to Flutter or to NUIFlutterView. It's a TIZEN PLATFORM level issue affecting ALL .NET UI apps that we install ourselves and launch via app_launcher.
 - CSFS works because it's a pre-installed Samsung system app with platform certs. The pre-fork worker pool launches CSFS via different path than `app_launcher --start`.
 
+### Iter 18 — Path B start: libecore_wl2 `_ecore_wl2_display_wait` patch (FAILED)
+
+**Hypothesis**: SMACK denial logs `subject="User" object="System" requested=r name=".wm_ready"` suggested our app cannot read `/run/.wm_ready`. `_ecore_wl2_display_wait` calls `access()` first; if non-zero return falls through to inotify wait, which never fires because the file was created at boot+6.6s, before our app starts at boot+120s.
+
+**Patch applied** to `/usr/lib64/libecore_wl2.so.1.25.1` at file offset 0x31b51:
+- Original: `0f 84 e1 01 00 00` = `je 31d38` (jump only if access() returned 0)
+- New:      `e9 e2 01 00 00 90` = `jmp 31d38; nop` (always jump to success)
+
+**Result**: same — `MinimalNUIApp.Main entered` / `Main calling Run` PHASE3_STDERR logged, then SILENT, no OnCreate, no further activity.
+
+**Root cause of patch failure**: the SMACK audit entries (timestamps 14.3-38.6s) were from systemd boot setup, not from our app at runtime (120s+). The `_ecore_wl2_display_wait` was NOT the actual blocker for our app.
+
+Patch reverted (`/tmp/libecore_wl2.so.orig` was restored to qcow2).
+
+### Phase 3 final stop condition (this session)
+
+**Proven facts**:
+1. .NET runtime starts in our app (Main entered, Run() entered, base.Run called).
+2. Native appcore_efl init runs inside base.Run (app_core_rotation Init fires).
+3. `appcore` main loop enters poll-wait state.
+4. **CREATE event is never delivered to the .NET layer for our app.**
+5. Same blocker for FlutterApplication (CoreUIApplication+elementary) AND NUIApplication AND MinimalNUIApp (just NUIApplication.OnCreate).
+6. Pre-installed Samsung apps (CSFS, QuickLaunch, HOME_MEDIA, WAS, etc.) DO get CREATE events in the same boot.
+7. libecore_wl2's `_ecore_wl2_display_wait` is not the blocker for our app.
+8. SMACK rule `User System -wx---` denies User-domain reads of System-labeled files, but audit shows this denial is for systemd, not our app's runtime path.
+
+**Unverified hypotheses for next session**:
+
+- **H11**: AMD's launchpad-application pre-fork worker pool only registers system apps for CREATE event delivery. Our user-installed app is launched via `app_launcher --start` which sends an "Application Start" command but no follow-up "CREATE deliver" command. The CREATE callback is fired by some AMD message that AMD only sends to pre-registered apps.
+
+- **H12**: enlightenment's `_e_mod_lwipc_send` for `/run/.wm_ready` triggers a callback chain that only registered processes receive. Pre-fork worker processes spawned at boot subscribe to this signal; our late-spawned process misses it.
+
+- **H13**: The `__on_app_fg_launch start timer for com.example.hello_tizen_tv(0)` AMD message starts a foreground-launch timer with a known timeout. Maybe the timer expires before our app finishes appcore init, AMD cancels the launch, but our app's appcore main loop is left running with no event source.
+
+- **H14**: There is a SMACK rule preventing AMD from sending a particular cmd (CREATE/RESUME) to apps not labeled System/Privileged.
+
+**Recommended next iteration**:
+1. Patch libamd.so.1 or the `libamd-mod-app-status-tv.so` to log every CREATE/RESUME dispatch with target PID — confirm whether AMD attempts to send to our app at all.
+2. Compare AMD log lines for CSFS launch vs our app launch.
+3. If AMD doesn't send CREATE to our app, patch AMD to force-send CREATE after timer expires.
+4. Alternative: install our app's resources INTO a pre-existing Samsung app's package directory and launch under that appid. This effectively becomes "running under a system pre-fork worker context."
+
+
+
 
 
 

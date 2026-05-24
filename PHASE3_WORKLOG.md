@@ -572,6 +572,30 @@ Both Path A (NUIApplication + NUIFlutterView, plus MinimalNUIApp) and Path B (li
 
 The next hypothesis path requires AMD-side instrumentation/patching, OR identification of a third wait point further inside the appcore main loop. Both are larger blast radius work suitable for a fresh session.
 
+### Iter 20 — Smoking gun in AMD logs (handoff for next session)
+
+After the iter19 patch + boot, AMD klog shows IMMEDIATELY after `__on_app_fg_launch start timer for com.example.hello_tizen_tv(0)`:
+
+```
+124.916 E/AMD_APP_GROUP(P 1558): app_group.c: _app_group_get_id(252) > Failed to find app status. pid(3869)
+124.922 E/AMD(P 1558): request_manager.cc: DispatchRequest(314) > dispatch_cb fail|cmd=CUSTOM_COMMAND:205
+```
+
+**AMD's DispatchRequest is failing with CUSTOM_COMMAND:205 because `_app_group_get_id` can't find app status for PID 3869.** PID 3869 is NOT our app's PID — it's likely a stale pre-fork pool worker reference. The launchpad pool worker that became our app's process has a different PID than what AMD's internal table tracked.
+
+This is consistent with iter5 observation: `app_group.c: _app_group_get_id(252) > Failed to find app status. pid(3910)` where 3910 ≠ actual launched PID 3620.
+
+**This is the FINAL ACTIONABLE HYPOTHESIS for next session**:
+- CUSTOM_COMMAND:205 is likely the message that triggers the appcore plugin to fire CREATE (or it sets a state that lets CREATE fire).
+- AMD's dispatch fails because of PID mismatch in `_app_group_get_id` lookup.
+- Fix: patch AMD's `_app_group_get_id` or `app-status.c` to ALSO look up by appid (not just pid) when pid lookup fails. OR patch out the failure check so the command dispatches anyway.
+
+Files: `/usr/share/amd/mod/libamd-mod-ui-core.so` (contains `_app_group_get_id` at file offset 0x86c0) and `/usr/share/amd/mod/libamd-mod-app-status-tv.so`.
+
+The `Failed to find app status. pid(N)` log strings are exact, so byte-grep finds the check function. Next session: disassemble the failing path and patch the early-return to fall through to the normal dispatch.
+
+
+
 
 
 

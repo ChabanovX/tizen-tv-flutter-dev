@@ -10,17 +10,41 @@ Tizen .NET appcore main loop enters successfully but `CREATE` lifecycle event is
 
 ## Hypotheses prioritized for next attempt
 
-### H11 (highest information gain): AMD doesn't dispatch CREATE to user-installed apps
-Approach:
-1. Instrument `/usr/share/amd/mod/libamd-mod-app-status-tv.so` and `/usr/share/amd/mod/libamd-mod-ui-core.so` to log every cmd dispatched and to which appid/pid.
-2. Compare what AMD sends to CSFS PID 1497 vs our PID 3614/3597 at launch time.
-3. If AMD never sends a CREATE/RESUME message to our app, patch AMD to ALWAYS send CREATE after `__on_app_fg_launch start timer` fires.
+### H11 (highest information gain) — CONFIRMED smoking gun in iter20
+
+**Evidence in klog right after our app's `__on_app_fg_launch start timer`**:
+```
+124.916 AMD_APP_GROUP: app_group.c: _app_group_get_id(252) > Failed to find app status. pid(3869)
+124.922 AMD: request_manager.cc: DispatchRequest(314) > dispatch_cb fail|cmd=CUSTOM_COMMAND:205
+```
+
+**Analysis**:
+- AMD's `_app_group_get_id` (in `libamd-mod-ui-core.so` @ 0x86c0) is queried with PID 3869.
+- PID 3869 is a STALE pre-fork pool worker reference; the actual launched-app PID is different (matches iter5 observation pid(3910) ≠ pid(3620)).
+- The lookup fails → AMD aborts dispatching `CUSTOM_COMMAND:205`.
+- `dispatch_cb fail` means the cmd 205 callback chain never executes for our app.
+- CUSTOM_COMMAND:205 is very likely the cmd that completes the launch handshake and lets appcore fire CREATE.
+
+**Recommended approach**:
+1. Disassemble `_app_group_get_id` in `libamd-mod-ui-core.so` at 0x86c0:
+   ```
+   ssh popos 'objdump -d /tmp/libamd-mod-ui-core.so | sed -n "/^00000000000086c0/,/^0000/p" | head -60'
+   ```
+2. Find the early-return that fires `Failed to find app status. pid(...)` log.
+3. Patch the early-return to fall through to a successful lookup path. Either:
+   - Always return success (return some valid app_status pointer instead of NULL)
+   - OR fall back to lookup by appid using the bundle (look at `__get_caller_id`/`__app_group_can_be_leader` paths)
+4. Equivalent in `libamd.so.1.78.2`'s `amd_app_status_find_by_effective_pid` — may need patching too.
+5. Boot, observe whether CUSTOM_COMMAND:205 dispatches successfully and OnCreate fires.
+
+This is the highest-information-gain step. Confirmed by direct klog evidence in the same boot that fails to fire OnCreate.
 
 Files to patch:
-- `/usr/lib64/libamd.so.1.78.2`
-- `/usr/share/amd/mod/libamd-mod-app-status-tv.so`
+- `/usr/share/amd/mod/libamd-mod-ui-core.so` (contains `_app_group_get_id` at 0x86c0)
+- Possibly `/usr/lib64/libamd.so.1.78.2`
+- Possibly `/usr/share/amd/mod/libamd-mod-app-status-tv.so`
 
-Hint: existing patch in this image at `libamd-mod-app-status-tv.so` (Phase 1 era) changed `__fg_launch_timeout` from 25s to 1000s via byte patch. Find that offset for context.
+Hint: existing Phase-1-era patch in `libamd-mod-app-status-tv.so` changed `__fg_launch_timeout` from 25s to 1000s via byte patch. That patch logic doesn't help OnCreate dispatch but shows the file is patchable.
 
 ### H12: enlightenment lwipc subscription
 - Late-spawned apps (boot+120s) missed the `/run/.wm_ready` lwipc signal published at boot+6.6s.

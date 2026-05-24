@@ -310,3 +310,15 @@ The fundamental issue: **Mesa wayland EGL functionally requires the compositor t
 - **No more app SIGABRTs visible**: signal handler patches + wl_proxy_wrapper_destroy@plt NOP prevent the cascading crashes
 
 **Distance to user goal**: One source-level patch away. Flutter UI requires working Mesa wayland EGL via wl_drm protocol; that's the only remaining blocker, and it's locked behind compositor or Mesa source rebuild.
+
+### Step 14 — Final binary attempt: NOP Mesa wl_drm-null check ❌
+
+Patched `dri2_initialize_wayland` at file offset `0x2d066` (the `je 0x2d4b8` that fails when wl_drm proxy is null) to 6-byte NOP. Idea: force Mesa to proceed past wl_drm check to try `zwp_linux_dmabuf_v1` fallback (code present at 0x2d4e0+ in same function).
+
+Boot result: same failure cascade. Mesa logs `failed to create dri2 screen` because fd=-1 — even with wl_drm check bypassed, Mesa needs a real DRM file descriptor to load any driver (softpipe included). Without compositor advertising wl_drm or zwp_linux_dmabuf with a valid device fd, Mesa physically cannot create a screen.
+
+This confirms the architectural constraint: **all paths through Mesa wayland EGL converge on needing a DRM fd from the compositor**, and software_tbm compositor mode doesn't supply one.
+
+## True hard blocker reached — binary patch attack surface fully exhausted
+
+All in-session binary-only approaches converge to the same wall: Mesa wayland EGL is architecturally bound to wl_drm/dmabuf protocol for fd acquisition; the compositor in software_tbm mode doesn't expose that protocol; no amount of NOPing PLT entries can synthesize a valid DRM fd. Source-level work (Mesa, compositor, or Flutter embedder) is the only remaining path forward, and that's outside autonomous session scope.

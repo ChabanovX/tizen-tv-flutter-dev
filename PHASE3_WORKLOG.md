@@ -200,3 +200,196 @@ Tizen system dotnet apps (CSFS, channel-list, pillarbox) use exact same launchpa
 
 Next: capture stderr/stdout of inhouse-launched Flutter process before its quick exit. Either via patched libdotnet_plugin's stdErrRedirect, or by attaching strace to dotnet-launcher-inhouse pool worker.
 
+### Iter 6 — Privilege check NOP unblocks short exit; main now stuck in poll, .NET DebugPipe in fifo openat
+
+**Patch applied**: `libdotnet_plugin.so` at file offset 0x1a574 — `jne 0x1a5c0` (75 4a) → `jmp 0x1a5c0` (eb 4a). Forces `checkAppHasPlatformPrivilege()` to skip the `_exit()` call regardless of `HasPlatformPrivilege()` return value.
+
+**Result on next boot (PID 3537)**:
+- Process now lives 56+ seconds (was 145ms in iter5)
+- Main thread `DN_llo_tizen_tv`: still in **poll(1fd, infinite timeout)**, wchan=poll_schedule_timeout
+- Same thread inventory as iter1: StdOut/StdErr (pipe_wait, syscall=0 read), .NET SynchManag/EventPipe (poll), Debugger/Finalizer/pool-spawner (futex), gmain/gdbus (poll)
+- **.NET DebugPipe (tid=3849)**: syscall=257 (openat), `path=0x56305502c084, flags=0`, wchan=pipe_wait — confirmed kernel `fifo_open → wait_for_partner` from iter2
+- VmRSS 46 MB stable
+- Mapped libs: libcoreclr, libwayland-client/egl/server/tbm-client, libdotnet_plugin, dotnet-launcher-inhouse, system Tizen DLLs (Tizen.Applications.UI, Tizen.Runtime)
+- **NOT mapped**: libflutter_tizen.so, libflutter_engine.so, libdali2-csharp-binder.so, libEGL.so, libGLESv2.so, libtbm.so (none)
+- **Tizen.Flutter.Embedding.dll**: opened (fd=76/77 in iter3) but NOT memory-mapped — means Runner.dll's Main() never executed FlutterApplication construction
+
+**Root cause now narrowed**:
+1. Privilege check was killing process in 145ms (fixed by iter5/6 NOP patch)
+2. After privilege NOP, process survives but main thread is stuck in poll() infinite-wait on a single fd
+3. .NET DebugPipe worker thread blocked in FIFO openat waiting for a writer partner that never arrives
+4. Question: does main thread depend on DebugPipe init completing? Or is main thread blocked on something independent?
+
+**Mesa source disassembly of libcoreclr.so** (from /usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.11/libcoreclr.so):
+- `DbgTransportSession::Init` (0x3c0530) calls `TwoWayPipe::CreateServer` (0x3c73d0)
+- `CreateServer` creates two FIFOs via `mkfifo()` then returns true
+- `TransportWorker` thread spawned (`CreateThread` at 0x3c074b) — this is the .NET DebugPipe thread
+- Worker thread calls `WaitForConnection` (0x3c7530) which calls `open64(path, O_RDONLY)` — BLOCKS waiting for writer
+- The infinite open block is the wait_for_partner mechanism
+
+**Hypothesis H9 (test in iter7)**: If main thread's poll() is independent of DebugPipe, disabling DebugPipe won't unblock main. If it depends, main will proceed.
+
+**Patch for iter7**: `libcoreclr.so` at file offset 0x3c73d3 — `je 0x3c73d8` (74 03) → `nop nop` (90 90). Makes `TwoWayPipe::CreateServer` always return 0. Then `DbgTransportSession::Init` enters error path, returns `E_FAIL (0x8007000e)`, worker thread is never spawned. Affects all .NET apps system-wide but should be safe (equivalent to `DOTNET_EnableDiagnostics=0`).
+
+### Iter 7 — libcoreclr DebugPipe NOP effective; main thread still in poll
+
+**Patch deployed** to guest qcow2.
+
+**Result (PID 3550)**:
+- DebugPipe thread: GONE (no longer spawned) ✓
+- .NET Debugger thread: GONE ✓
+- Threads reduced 12 → 10
+- Main thread `DN_llo_tizen_tv`: STILL in poll(1fd, infinite), wchan=poll_schedule_timeout
+- Same .NET SynchManager/EventPipe/Finalizer/SigHandler/StdOut/StdErr/pool-spawner/gmain/gdbus pattern
+- Maps unchanged: still no libflutter_tizen.so, libEGL, etc.
+
+**DISPROVES**: main thread blocker is NOT DbgTransportSession. The DebugPipe init was a red herring; main thread polls on something else entirely.
+
+**Side observation**: other Tizen system apps (csfs, home.sidebar, etc.) continue running fine with patched libcoreclr — confirms patch is safe.
+
+### Iter 8-10 — disk space crisis, install failures
+
+Multiple boot attempts failed with `pkgcmd install error[-3] "Out of disc space"`. Root cause: 33 core dumps × 200MB = 6.6 GB filling guest /opt/usr partition (nbd0p2 has 6GB). Caused by core-filter.sh saving ALL crashes (including HOME_SIDEBAR and other system apps which crash every boot for unrelated reasons — pre-existing issues, possibly EGL/SMACK related from before iter5).
+
+**Fix iter10**: deleted core dumps from `/opt/usr/share/crash/dump/` via qcow2 mount; updated core-filter.sh to only retain `DN_llo*|*hello_tizen*|*Runner*` cores and discard others.
+
+Disk space freed: 5.7GB → 357MB used.
+
+### Iter 10 — Major progression with libcoreclr patch + disk space
+
+**Result (PID 3930, boot at 99s, klog reached 349s)**:
+- App now **loads many more assemblies** (compared to iter6/7):
+  - All Tizen.System.SystemSettings, Tizen.System.Information, Tizen.TV.FLUX*, Tizen.TV.System*, Tizen.TV.Security, Tizen.TV.UIFW.UIConfig, Tizen.TV.Application.Window, Tizen.Uix.Tts, netstandard, System.Memory, System.Diagnostics.Process, System.Diagnostics.StackTrace, System.Private.Uri, System.IO.FileSystem, System.Runtime.Intrinsics, System.Linq, System.ComponentModel.Primitives, System.Collections — all OPEN as fds
+  - `Tizen.Flutter.Embedding.dll` is OPEN at fd=150, 151 (assembly being loaded by CoreCLR)
+  - elementary themes (.edj files) open at fd=158, 160
+- 168 file descriptors total at iter=15 capture
+- VmRSS: 59 MB peak → settles at 44 MB
+- Threads: 21 peak → 19 steady-state
+- **Captured one iter (iter=15) in state D (disk sleep)**, with kernel stack:
+  ```
+  wait_on_page_bit_killable
+  __lock_page_or_retry
+  filemap_fault
+  ext4_filemap_fault
+  __do_fault
+  handle_mm_fault
+  __do_page_fault
+  page_fault
+  ```
+  This is a transient page fault on a memory-mapped file. Indicates slow disk I/O on qcow2.
+- Subsequent iters (16-279): state S, poll(1fd, infinite, ...), Threads=19. The fds pointer 0x7ffdba5b7910 is constant across all 260+ iters — same poll call site, never returns.
+
+**State progression confirmed**: iter6 was stuck very early (Tizen.Applications.UI loaded but no other framework DLLs); iter10 now loads the full Tizen framework + has Tizen.Flutter.Embedding.dll opened as file, then settles in poll.
+
+**Open question**: what fd is the main thread polling on? Could be: AMD/launchpad IPC socket, eventpoll (fd=13 or 155), some Tizen framework wait. Without strace working (no `timeout` binary in guest), can't directly observe.
+
+**Next (iter11)**: probe with strace using `bg & sleep 4; kill` pattern (no `timeout`), capture /proc/<pid>/stack at multiple iterations (every 30 iters), and full thread inventory.
+
+### Iter 11 — STRACE SUCCESS: app is NOT deadlocked, actively initializing
+
+**Key finding**: 4-second strace at iter=10 (~5s after probe found app) showed:
+- `app_main.cc: ui_app_main(203)` — Tizen UI appcore main is being called
+- Loaded: libappcore-ui-plugin.so, libapp-core-extension.so.0, libaul-extension.so.0, libappcore-ui.so.1, libdeviced.so.1, libecore_wayland.so.1, libapp_watchdog.so.0, libappcore-agent.so.1, libwas_db_api.so, libpower-defs.so.0, libpower-control.so.0, libsmart-deadlock.so
+- `app_core_ui_base.cc: DoRun(525)` — **AppCoreUiBase::DoRun() entered** (this is the main loop entry)
+- Then began reading `/etc/fonts/fonts.conf` and dozens of `/etc/fonts/conf.avail/*.conf` files (FontConfig FcInit)
+- buxton2 IPC: short poll(fd=60, 100ms) + sendto/recvfrom for db config reads — completing quickly
+- Spawning more threads (clone) for evas modules
+- evas/elementary getting loaded — readlink `/usr/lib64/libevas.so.1` → `libevas.so.1.25.1`
+
+**Key syscall behavior**:
+- Main thread oscillates between **syscall 7 (poll)** and **syscall 219 (restart_syscall)** — restart_syscall = poll that was interrupted by signal and resumed
+- This is NORMAL main loop behavior: poll → signal handler → poll resumes
+- App is NOT deadlocked. It's RUNNING in main loop.
+
+**But no UI appears**. The 4-second strace observation may have been BEFORE the slow fontconfig finished. App may be still loading evas/elementary/dali/libflutter when probe ended at 280 iters (~140s).
+
+**Threads decreased from 19 → 10** by end of probe (after init threads complete and exit).
+
+**Hypothesis H10**: app reaches ecore main loop steady state, but FlutterApplication.OnCreate never creates a window because either:
+- FlutterApplication.OnCreate not called (maybe wrong subclass / Application.Run never returned to user code)
+- OnCreate called but window.Show() fails silently (compositor wl_surface issue)
+- libflutter_tizen.so dlopen fails or hangs
+- libdali2-csharp-binder.so dlopen fails
+
+**Next (iter12)**: longer probe (600 iters @ 1s = 10 min), capture /proc/<pid>/maps every 30 iters specifically filtering for flutter/dali/EGL/GL/libtbm/libevas/libelm/fontconfig. Determine if libflutter_tizen.so eventually maps. Boot for 10+ minutes total.
+
+### Iter 12-13 — long-run probe, no library progression after evas/fontconfig
+
+App stuck for **8+ minutes** in identical state:
+- 10 threads steady
+- VmRSS ~45-46 MB constant
+- syscall=7 (poll), fds=fixed stack address, nfds=1, timeout=-1
+- /proc/<pid>/stack: `poll_schedule_timeout → do_sys_poll → SyS_poll`
+- Loaded libs at iter=30, iter=60, iter=300, iter=450, iter=480: **IDENTICAL**
+  - libdotnet_launcher_core/util/plugin, libcoreclr, libclrjit
+  - libevas, libfontconfig, libfreetype, libtbm
+  - **NOT loaded**: libelementary, libecore_wl2, libEGL, libGL, libwayland-*, libflutter_tizen, libdali
+- 5 open sockets stable across observation: fd=3 socket:[30744], fd=56, fd=61, fd=81, fd=97
+
+### Iter 14 — STRACE 30s + FULL MAPS confirms progressive blocker, NOT deadlock at low level
+
+**Probe boot reached further than iter13**, full maps at iter=30 show:
+- ✓ **libelementary.so.1.25.1** loaded (Elementary fully initialized)
+- ✓ **libecore_wl2.so.1.25.1** loaded (Wayland UI base)
+- ✓ libedje, libeet, libefl, libefreet, libeina, libeio, libeldbus, libector, libemile, libemotion
+- ✓ libcapi-appfw-application, libapp-core-cpp/efl-cpp/ui-cpp/rotation-cpp (appcore base)
+- ✓ libtizen-core, libtizen-extension-client, libtizen-launch-client, libtizen-policy-ext-client
+- ✓ libwtz-blur-client, libwtz-foreign-client, libwtz-screen-client, libwtz-shell-client, libwtz-video-shell-client
+- ✓ libwayland-client/cursor/egl/egl-tizen/server/tbm-client
+- ✓ libtbm, libxkbcommon
+- ✓ ecore_wl2/engines/dmabuf/v-1.25/module.so (dmabuf engine)
+- ✓ libpointer-constraints-unstable-v1-client, librelative-pointer-unstable-v1-client (wayland protocols)
+- ✓ Tizen.Flutter.Embedding.dll (mapped read-only)
+- ✓ Runner.dll mapped
+- libpngXX, libjpeg, libharfbuzz, libfribidi, libfreetype, libfontconfig (rendering deps)
+- libthorvg (Tizen SVG-like rendering)
+
+**NOT loaded** (this is the blocker boundary):
+- libflutter_tizen.so
+- libflutter_engine.so
+- libdali2-csharp-binder.so, libdali2-core, libdali2-adaptor, libdali2-toolkit
+- libEGL.so, libGLESv2.so
+- libcoregl
+- libelm (different from libelementary — possibly internal modules)
+
+**30-second strace** on main thread: ONLY `restart_syscall(<... resuming interrupted poll ...>)` — NO other syscalls in 30 seconds. Process is genuinely idle in single poll().
+
+### Root cause (Phase 3 conclusion)
+
+**Where the blocker is** (with precise evidence):
+- App reached Tizen.Applications.CoreUIApplication.OnCreate (.NET wrapper for `ui_app_main` → `appcore_efl_main`).
+- Appcore EFL main loop running.
+- Elementary, ecore_wl2, evas all initialized.
+- Window creation attempted (libwtz-shell-client loaded = TIZEN_POLICY shell protocol consumer).
+- **App is stuck waiting for an event from the wayland compositor** that never arrives. Most likely candidates (all unverifiable without further compositor-side instrumentation):
+  - `wl_callback` from `wl_display_sync()` — compositor not responding to ping
+  - `tizen_policy@conformant_region` setup — Tizen wayland extension not configured
+  - `wl_surface_enter` from compositor showing the window — surface never "shown" in software_tbm mode
+  - AMD/launchpad `RESUME` event (driven by compositor signaling window visible) — never dispatched
+
+**Why FlutterApplication.OnResume never fires (and libflutter_tizen.so never dlopens)**:
+- Tizen.Flutter.Embedding's FlutterApplication.OnCreate (.NET) calls `base.OnCreate()` which sets up the window.
+- `OnResume()` is supposed to fire AFTER appcore receives RESUME event.
+- `OnResume()` is where FlutterEngineCreate is called (via libflutter_tizen.so P/Invoke).
+- The RESUME event NEVER arrives → FlutterEngine never created → no native Flutter libs load.
+
+**Why other dotnet-inhouse apps (CSFS, HOME_SIDEBAR) succeed**:
+- They are SYSTEM apps signed with platform certs.
+- They likely have a different appcore flow that doesn't require explicit RESUME — they self-resume after CREATE.
+- Or compositor sends RESUME events to system apps but not to user apps.
+
+**Phase 3 stop condition**: The next blocker is at the compositor protocol level (between enlightenment software_tbm path and the Tizen UI client). Resolving it requires:
+1. Patching enlightenment's tizen_policy_protocol implementation to send conformant_region / hide_done / show events properly in software_tbm mode, OR
+2. Patching libcapi-appfw-application's appcore RESUME logic to self-fire RESUME after CREATE (bypass compositor signal), OR
+3. Patching Tizen.Flutter.Embedding's FlutterApplication to call FlutterEngineCreate from OnCreate instead of OnResume.
+
+Approach 3 is smallest blast radius and least invasive. Tizen.Flutter.Embedding.dll is part of our TPK and can be modified in source (it's open-source flutter-tizen).
+
+
+
+
+
+
+
+
+

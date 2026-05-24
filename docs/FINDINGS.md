@@ -2626,6 +2626,66 @@ This is the deepest we can go without writing a real LD_PRELOAD shim or patching
 
 ---
 
+## Iteration 19 — Mesa integration deep — full layered analysis
+
+After iter18, continued pushing on Mesa stack integration to find a path to visible UI. Mounted qcow2, applied SMACK labels, fixed libgbm symlink (broken by ext4 journal inconsistency from multiple mount cycles), placed dri_gbm.so at Mesa's hardcoded fallback path `/opt/usr/home/vld/mesa-install/lib/x86_64-linux-gnu/gbm/dri_gbm.so` (Tizen's /home → /opt/usr/home symlink).
+
+### Result space explored
+
+| Configuration | enlightenment | klog signal |
+|---|---|---|
+| Samsung COREGL wrapper + Samsung YAGL driver (original) | runs, /dev/yagl absent → libEGL exits | "Unable to open YaGL kernel device" |
+| Samsung wrapper + iter17-patched YAGL (return 1) | runs, then crashes in yagl_get_state on open() | Same |
+| Samsung wrapper + Mesa libEGL at driver/ + libgbm available | crashes in libc.so.6 at libc+0x681e0, fault 0x369 | `enlightenment[1755]: segfault at 369` |
+| Mesa wrapper (libEGL.so.1.4 = Mesa) + Mesa driver | crashes identically in libc.so.6 | Same |
+| Samsung wrapper + Mesa driver + EGL_PLATFORM auto-detect | enlightenment hangs, no `/run/.wm_ready` created | `MESA-EGL: warning: invalid EGL_PLATFORM given`, `AUL ANR: main thread unable to enter idle state` |
+
+### Why it cascades
+
+Visible Flutter UI requires this entire chain working:
+
+```
+kernel (yagl module loaded but binds to no PCI device — no /dev/yagl)
+  ↓ skip yagl via Mesa
+Mesa libEGL (loaded, but Samsung COREGL wrapper calls into it expecting Samsung-specific extensions)
+  ↓ COREGL strlen(NULL) or unrecognized return value → SIGSEGV
+enlightenment compositor (never starts → /run/.wm_ready never created)
+  ↓ blocked
+all Tizen apps that wait for .wm_ready (volume-app, csfs, wrt-loader, tvctx-manager, our Flutter app)
+  ↓ stuck in init
+libflutter_tizen.so (would need ecore_wl2 + wayland_egl evas engine, both gated by working compositor)
+  ↓
+Flutter Dart layer (never starts rendering)
+```
+
+Each wall here is a multi-day RE/dev project. The aggregate to get **visible Flutter UI** on this Linux box without real hardware is:
+
+1. Write LD_PRELOAD shim for Samsung COREGL ↔ Mesa adapter (~3 days C dev)
+2. Possibly modify Mesa to expose Samsung-expected vendor strings (~1 day)
+3. Debug downstream evas / DALi failures that pop up after EGL works (?)
+4. Debug libflutter_tizen.so specific failures (?)
+
+The current state in guest qcow2:
+- `/usr/lib64/driver/libEGL.so.1.0` — Mesa libEGL.so.1.0.0 (470 KB)
+- `/usr/lib64/driver/libGLESv2.so.2.0` — Mesa libGLESv2.so.2.0.0 (59 KB)
+- `/usr/lib64/driver/libGLESv1_CM.so.1.0` — Mesa libGLESv1_CM.so.1.1.0 (33 KB)
+- `/lib64/libgallium-26.2.0-devel.so` — Mesa softpipe runtime (22 MB)
+- `/lib64/libgbm.so.1` → `/lib64/libgbm.so.1.0.0` (Mesa libgbm)
+- `/usr/lib64/gbm/dri_gbm.so` — Mesa DRI driver
+- `/opt/usr/home/vld/mesa-install/...` — duplicate at hardcoded fallback path
+- `/etc/profile.d/zz-mesa.sh` + `/etc/systemd/system.conf.d/mesa-env.conf` — env overrides
+- Original Samsung libs backed up as `.coregl`, `.samsung`, `.orig` siblings
+
+The current state is reversible: replace `driver/libEGL.so.1.0` etc. with their `.orig` / `.samsung` backups and the guest behaves like at iter11.
+
+### Final practical recommendation
+
+**Visible Flutter UI on this Linux emulator stack is not achievable without significant additional dev work or real hardware.** The combinatorics of Samsung's emulator's COREGL ↔ YAGL ↔ libdrm_vigs chain are not bridge-able by binary patches alone — they require either source-level reimplementation of the YAGL host protocol, or a custom Mesa build with Samsung-compat extensions, or substituting in real hardware where YAGL is not the path.
+
+Headless development pipeline remains the deliverable. App builds, installs, launches, Dart VM Service runs. For visual UI verification: real Samsung Smart TV in developer mode.
+
+---
+
 ## Iteration 16 — Offline install via qcow2-mount → app launched but no visible render
 
 Since sdb shell was unreliable, used qemu-nbd mount to inject the TPK directly into guest filesystem and add a systemd oneshot service that runs `pkgcmd -i` + `app_launcher` at boot.

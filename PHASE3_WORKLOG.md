@@ -551,6 +551,29 @@ Patch reverted (`/tmp/libecore_wl2.so.orig` was restored to qcow2).
 3. If AMD doesn't send CREATE to our app, patch AMD to force-send CREATE after timer expires.
 4. Alternative: install our app's resources INTO a pre-existing Samsung app's package directory and launch under that appid. This effectively becomes "running under a system pre-fork worker context."
 
+### Iter 19 — Path B: libappcore-ui-plugin `LwipcWaitEvent` NOP (FAILED)
+
+**Hypothesis**: `libappcore-ui-plugin.so`'s `__init_wayland` calls `LwipcWaitEvent` to wait for the `/run/.wm_ready` signal. This signal was published by enlightenment at boot+6.6s and consumed by pre-registered apps. Our app, started at boot+120s, missed the signal and waits forever inside `LwipcWaitEvent`.
+
+**Patch applied** to `/usr/share/appcore/plugins/libappcore-ui-plugin.so` at file offset 0x6db6:
+- Original: `e8 e5 d2 ff ff` = `call LwipcWaitEvent@plt` (5 bytes)
+- New:      `90 90 90 90 90` = five NOPs (call skipped, no wait)
+- After the call, `__init_wayland` doesn't check the return value of LwipcWaitEvent. Skipping the call is safe.
+
+**Result**: same — no PHASE3_TRACE for OnCreate, app silent past `app_core_rotation Init`. The patch did not unblock OnCreate.
+
+**Implication**: either the wait is not on this specific path, OR there's an additional gate further down that also requires wm_ready/window-ready state. Likely the SECOND gate (the C# OnCreate hook fires only after a window is actually created, and window creation has its own deeper wait).
+
+Patch reverted on qcow2.
+
+### Final stop condition
+
+Both Path A (NUIApplication + NUIFlutterView, plus MinimalNUIApp) and Path B (libecore_wl2 `_ecore_wl2_display_wait` patch, plus libappcore-ui-plugin `LwipcWaitEvent` NOP) have been EXHAUSTED with concrete evidence. The OnCreate-never-fires blocker is not resolved by any user-side change (Path A) and is not at either of the two wait points patched in Path B.
+
+The next hypothesis path requires AMD-side instrumentation/patching, OR identification of a third wait point further inside the appcore main loop. Both are larger blast radius work suitable for a fresh session.
+
+
+
 
 
 

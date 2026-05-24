@@ -25,6 +25,7 @@ Concrete artifacts that prove what's been observed.
 | 5 | `/usr/lib64/libdotnet_plugin.so` | 0x1a574 | `75 4a → eb 4a` | `jne → jmp`: `checkAppHasPlatformPrivilege` always success path, no `_exit()` |
 | 7 | `/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.11/libcoreclr.so` | 0x3c73d3 | `74 03 → 90 90` | `je → nop nop`: `TwoWayPipe::CreateServer` always returns 0, no DebugPipe worker spawned |
 | 18 | `/usr/lib64/libecore_wl2.so.1.25.1` | 0x31b51 | `0f 84 e1 01 00 00 → e9 e2 01 00 00 90` | `je → jmp`: `_ecore_wl2_display_wait` skips access() check. **REVERTED** — didn't help. |
+| 19 | `/usr/share/appcore/plugins/libappcore-ui-plugin.so` | 0x6db6 | `e8 e5 d2 ff ff → 90 90 90 90 90` | NOP out `call LwipcWaitEvent@plt` in `__init_wayland`. **REVERTED** — didn't help. |
 
 Pre-Phase-3 (Phase 2) binary patches still in effect:
 - `/usr/bin/enlightenment` @ 0x4877e: 6-byte NOP forces software_tbm path → compositor reaches MAIN LOOP.

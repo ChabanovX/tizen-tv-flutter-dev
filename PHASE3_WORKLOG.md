@@ -620,7 +620,43 @@ Patch REVERTED.
 2. The naive patch (iter21) doesn't work because of downstream side effects.
 3. The next surgical patch should change `amd_app_status_find_by_effective_pid`'s behavior, OR add an alternative lookup-by-appid only inside `_app_group_get_id`'s `je` failure branch.
 
-### Phase 3 Session Stop — final
+### Iter 22 — Surgical patch on failure-branch only (also FAILED, comss respawn loop)
+
+After iter21 was reverted, I tried a more surgical version:
+- Function entry (0x86c0) UNCHANGED — preserves all callers' correct behavior
+- Only the failure block at 0x8740-0x875e (30 bytes) replaced with `b8 01 00 00 00 c3` (`mov eax,1; ret`) + 24 NOPs
+- This makes ONLY the pid-lookup-failure case return 1 instead of 0; success path and app_type==4 path untouched
+
+**Result**: also broke the system. The boot showed AMD child processes (PIDs 5660, 5683, 5709, 5732, 5751) spawning every ~3s in a respawn loop with:
+```
+LAUNCHPAD: OnIOEventReceived: Permission denied. pid(N)
+AUL: aul_launch_app_fast_without_resinfo_for_uid: Failed to send request. appid: comss, error: -1
+AMD_APP_FINDER_TV: __foreach_user_dir: Failed to get appid. pid(N)
+```
+
+The `comss` service can't launch, causing the launchpad to retry every 3 seconds. hello-flutter.service never reached install.
+
+**Patch reverted.**
+
+**Root cause of failure**: returning 1 unconditionally from the failure branch confuses callers that depended on the lookup actually failing (returning 0 to indicate "no group exists"). The correct fix is conditional: return real fallback ID looked up by appid, not a stub 1. That requires injecting an `amd_app_status_find_by_appid` call — impossible without writing new code and patching the call sites.
+
+### Phase 3 Session Stop — final (genuine)
+
+After iter22 also broke the system, I confirm the stop. The smoking-gun chain is:
+1. Pre-fork pool worker PID mismatch in `amd_app_status_find_by_effective_pid` → returns NULL.
+2. `_app_group_get_id` returns 0 (with log) → DispatchRequest aborts CUSTOM_COMMAND:205.
+3. CUSTOM_COMMAND:205 abort → some downstream state never satisfied → appcore never fires CREATE → user OnCreate never runs.
+
+Both ends of the chain are out of byte-NOP-patchability:
+- (a) Fixing the pid lookup requires querying by appid, which is new code, not a NOP.
+- (b) Skipping the failure check at DispatchRequest requires understanding which one of the many command paths in libamd.so corresponds to cmd=205 AND patching that specific path.
+
+The next session should approach this either via:
+- Compile a small shared library shim that overrides `amd_app_status_find_by_effective_pid` (LD_PRELOAD into AMD) — but AMD is started by systemd as root, LD_PRELOAD is harder there.
+- OR find AMD's command-handler table (libamd.so) and patch the cmd 205 entry to a no-op or alternative handler.
+- OR install our app under a Samsung appid that has correct pre-fork worker registration (no patching at all).
+
+
 
 
 
